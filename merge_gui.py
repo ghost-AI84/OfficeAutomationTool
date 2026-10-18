@@ -6,12 +6,13 @@ Excel 批量合并工具（图形界面版）
   - 以第一个文件的表头为准，列顺序不变
   - 后续文件表头若与主表头仅存在"格式差异"（空格、全角半角、大小写、
     换行、不可见字符等），自动视为同一列并对齐到主表头
+  - 新增：智能同义词识别（如"身份证"与"身份证号码"自动对齐）
   - 日志会打印每一条对齐记录，方便核对
   - 新增"数据来源"列，记录数据来自哪个文件
   - 输出 xlsx 后自动调整列宽
 
 依赖：
-  pip install pandas openpyxl xlrd pyxlsb odfpy
+  pip install pandas==1.5.3 numpy==1.24.4 openpyxl xlrd pyxlsb odfpy
 """
 
 import tkinter as tk
@@ -48,6 +49,23 @@ NA_TOKENS = {
 TRUE_TOKENS  = {"是", "有", "y", "yes", "true", "t", "√", "✓", "对"}
 FALSE_TOKENS = {"否", "无", "n", "no", "false", "f", "×", "✗", "错"}
 
+# 表头智能探测关键词库（增加权重，降低大标题误判）
+HEADER_KEYWORDS = {"日期", "时间", "编号", "姓名", "名称", "金额", "数量", "单价", "部门", "状态", "手机", "电话", "地址", "id", "name", "date", "amount", "备注", "分类"}
+
+# 表头同义词映射（左边是变体，右边是标准词）
+SYNONYM_MAP = {
+    "身份证": "证件号",
+    "身份证号码": "证件号",
+    "证件号码": "证件号",
+    "手机": "电话",
+    "手机号": "电话",
+    "联系电话": "电话",
+    "金额(元)": "金额",
+    "总金额": "金额",
+    "订单日期": "日期",
+    "交易时间": "日期",
+}
+
 # 不可见字符（零宽空格、BOM、软连字符等），匹配时全部剔除
 _INVISIBLE_CHARS = "\u200b\u200c\u200d\u2060\ufeff\u00ad\u180e"
 
@@ -70,9 +88,7 @@ def _noop(*args, **kwargs):
 def _match_key(name, case_sensitive=False, strip_punct=False):
     """
     生成用于表头匹配的键。
-    处理内容：剔除不可见字符、各类空白统一为普通空格、全角转半角、
-            连续空格压缩、大小写、可选标点。
-    仅用于匹配，不改变输出表头。
+    处理内容：剔除不可见字符、空白统一、全角转半角、同义词映射、大小写、标点。
     """
     if name is None:
         return ""
@@ -89,7 +105,7 @@ def _match_key(name, case_sensitive=False, strip_punct=False):
     for ch in _WHITESPACE_CHARS:
         s = s.replace(ch, " ")
 
-    # 3. 全角转半角（数字、字母、常见标点；汉字不变）
+    # 3. 全角转半角
     s = unicodedata.normalize("NFKC", s)
 
     # 4. 连续空白压缩成一个空格，去首尾
@@ -102,6 +118,10 @@ def _match_key(name, case_sensitive=False, strip_punct=False):
     # 6. 可选：去掉中英文常见标点
     if strip_punct:
         s = re.sub(r"[，。、；：！？（）【】《》\"'`,.;:!?()\[\]{}<>]", "", s)
+
+    # 7. 同义词智能替换（如 身份证号 -> 证件号）
+    if s in SYNONYM_MAP:
+        s = SYNONYM_MAP[s]
 
     return s
 
@@ -131,8 +151,20 @@ def _to_number(v):
     if is_pct:
         s = s[:-1].strip()
 
+    # 处理中文单位
+    multiplier = 1
+    if s.endswith("万") or s.endswith("萬"):
+        multiplier = 10000
+        s = s[:-1]
+    elif s.endswith("千万"):
+        multiplier = 10000000
+        s = s[:-2]
+    elif s.endswith("亿"):
+        multiplier = 100000000
+        s = s[:-1]
+
     s = re.sub(r"[¥$€£￥]", "", s)
-    s = re.sub(r"(元|人民币|rmb|usd|美元|万元|万|元整)$", "", s, flags=re.I)
+    s = re.sub(r"(元|人民币|rmb|usd|美元|元整)$", "", s, flags=re.I)
     s = s.replace(",", "").replace("，", "").strip()
 
     neg = False
@@ -140,7 +172,7 @@ def _to_number(v):
         neg, s = True, s[1:-1].strip()
 
     try:
-        num = float(s)
+        num = float(s) * multiplier
     except ValueError:
         return v
 
@@ -172,15 +204,18 @@ def _to_bool(v):
 
 
 def _safe_to_datetime(s, fmt=None):
+    """修复了 pandas 1.5.3 不支持 format='mixed' 的兼容性问题"""
     try:
         if fmt:
             return pd.to_datetime(s, errors="coerce", format=fmt)
-        return pd.to_datetime(s, errors="coerce", format="mixed")
-    except (TypeError, ValueError):
+        # 尝试自动推断（兼容旧版 pandas）
+        return pd.to_datetime(s, errors="coerce")
+    except Exception:
         return pd.to_datetime(s, errors="coerce")
 
 
 def _infer_col_type(series):
+    """优化了推断逻辑，减少 map 循环，利用 pandas 原生提速"""
     non_na = series.dropna()
     if len(non_na) == 0:
         return "text"
@@ -188,16 +223,12 @@ def _infer_col_type(series):
     if pd.api.types.is_datetime64_any_dtype(series):
         return "datetime"
 
-    bool_ok = sum(
-        1 for v in non_na
-        if isinstance(v, bool)
-        or (isinstance(v, str) and _clean_text(v).lower() in (TRUE_TOKENS | FALSE_TOKENS))
-    )
-    if bool_ok / len(non_na) >= 0.9:
-        str_vals = [v for v in non_na if isinstance(v, str)]
-        if str_vals or all(isinstance(v, bool) for v in non_na):
-            return "bool"
+    # 1. 布尔值判断
+    bool_mask = non_na.astype(str).str.lower().str.strip().isin(TRUE_TOKENS | FALSE_TOKENS)
+    if bool_mask.mean() >= 0.9:
+        return "bool"
 
+    # 2. 数字判断（结合了中文单位和 NA 过滤）
     num_ok = 0
     for v in non_na:
         if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
@@ -209,6 +240,7 @@ def _infer_col_type(series):
     if num_ok / len(non_na) >= 0.9:
         return "number"
 
+    # 3. 日期判断
     if non_na.map(lambda x: isinstance(x, str)).all():
         sample = non_na.head(200)
         if not sample.str.fullmatch(r"-?\d+(\.\d+)?").all():
@@ -220,6 +252,7 @@ def _infer_col_type(series):
 
 
 def _convert_column(series, dtype, date_format=None):
+    # 先统一将 NA 字符串替换为真正的 np.nan
     s = series.map(
         lambda v: np.nan if (isinstance(v, str) and _clean_text(v).lower() in NA_TOKENS) else v
     )
@@ -270,22 +303,32 @@ def _read_raw(path, sheet_name=0):
 
 
 def _detect_header_row(df, max_scan=20):
+    """智能打分识别表头：结合非空数量、文本占比、关键词命中"""
     n = min(len(df), max_scan)
     if n == 0:
         return 0
-    counts = []
+        
+    scores = []
     for i in range(n):
         row = df.iloc[i]
         nn = int(row.notna().sum())
-        vals = [v for v in row if pd.notna(v)]
-        sl = sum(1 for v in vals if isinstance(v, str) and v.strip())
-        counts.append((nn, sl))
-    max_nn = max(c[0] for c in counts)
-    threshold = max(2, int(max_nn * 0.6))
-    for i, (nn, sl) in enumerate(counts):
-        if nn >= threshold and sl >= max(1, nn * 0.5):
-            return i
-    return max(range(n), key=lambda i: (counts[i][0], -i))
+        vals = [str(v).lower() for v in row if pd.notna(v)]
+        
+        # 1. 基础分：非空单元格数量
+        score = nn
+        
+        # 2. 文本分：表头通常是字符串
+        str_count = sum(1 for v in vals if v.strip())
+        if nn > 0:
+            score += (str_count / nn) * 5
+            
+        # 3. 关键词分：命中常见表头关键词（极高权重）
+        keyword_hits = sum(1 for v in vals if any(kw in v for kw in HEADER_KEYWORDS))
+        score += keyword_hits * 10
+        
+        scores.append(score)
+        
+    return max(range(n), key=lambda i: scores[i])
 
 
 # ---------------------------------------------------------------- 列宽自适应
@@ -495,7 +538,7 @@ def merge_files(
                 "  数据=" + str(body.shape[0]) + " 行 x " + str(body.shape[1]) + " 列")
 
             if matched_diff:
-                log("  表头对齐（格式差异，视为同一列）：")
+                log("  表头对齐（智能匹配，视为同一列）：")
                 for src, dst in matched_diff:
                     log("    " + repr(src) + "  ->  " + repr(dst))
 
@@ -569,7 +612,7 @@ def merge_files(
 
 
 # =====================================================================
-#                         二、图形界面
+#                         二、图形界面 (保持原样)
 # =====================================================================
 
 class MergeApp:
@@ -645,7 +688,7 @@ class MergeApp:
         fr1.pack(fill="x", padx=4, pady=3)
         self.opt_fuzzy = tk.BooleanVar(value=True)
         ttk.Checkbutton(fr1,
-                        text="启用（忽略多余空格、全角半角、换行、不可见字符等）",
+                        text="启用（智能同义词、忽略空格/全半角/不可见字符等）",
                         variable=self.opt_fuzzy).pack(side="left")
         self.opt_case = tk.BooleanVar(value=False)
         ttk.Checkbutton(fr1, text="区分大小写", variable=self.opt_case).pack(side="left", padx=(12, 0))
