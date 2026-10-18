@@ -36,10 +36,10 @@ jobs:
 
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller --onefile --windowed --name OfficeAutomationTool merge_gui.py
+          pyinstaller --onefile --windowed --name ExcelMergeTool --paths src apps/merge_excel.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: OfficeAutomationTool-win7
-          path: dist/OfficeAutomationTool.exe
+          name: ExcelMergeTool-win7
+          path: dist/ExcelMergeTool.exe

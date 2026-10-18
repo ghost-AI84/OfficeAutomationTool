@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """界面测试：布局、校验、设置持久化、日志裁剪。
 
 需要可用的图形环境；无法创建窗口时自动跳过（返回 0），
@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 # 沙箱/CI 上不写用户真实配置，改用临时目录
 os.environ["APPDATA"] = tempfile.mkdtemp(prefix="merge-appdata-")
@@ -63,7 +63,7 @@ def main():
     print("  header entry follows mode         OK")
 
     # 3. 参数收集
-    app.files = [str(ROOT / "merge_gui.py")]
+    app.files = [str(ROOT / "apps" / "merge_excel.py")]
     app.v_output.set(str(Path(tempfile.gettempdir()) / "x.xlsx"))
     opts, warns = app._collect_options()
     assert isinstance(opts, MergeOptions)
