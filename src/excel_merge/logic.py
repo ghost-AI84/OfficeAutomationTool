@@ -760,8 +760,14 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
             if value is None:
                 value = options.header_row.get(f.name)
             if value is None:
-                value = options.header_row.get(f.stem, 1)
-            h = int(value) - 1
+                value = options.header_row.get(f.stem)
+            if value is None:
+                # 调整后又新增的文件：没有指定就回到自动检测
+                info = detect_header(raw)
+                h = info.row
+                log("  未单独指定，自动检测表头：第 %d 行" % (h + 1))
+            else:
+                h = int(value) - 1
         else:
             h = int(options.header_row) - 1
         h = max(0, min(h, max(len(raw) - 1, 0)))

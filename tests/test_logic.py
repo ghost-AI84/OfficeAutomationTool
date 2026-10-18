@@ -144,7 +144,7 @@ def test_headers_at_different_rows():
 
 
 def test_per_file_header_override():
-    """逐文件指定表头行，优先于自动识别。"""
+    """逐文件指定表头行，优先于自动识别；未指定的文件退回自动检测。"""
     b = _write_grid("hdr_override.xlsx", [
         ["销售明细", None],
         [None, None],
@@ -153,6 +153,17 @@ def test_per_file_header_override():
     ])
     df, _ = run([b], out="hdr_override_out.xlsx", header_row={b: 1})
     assert str(df.columns[0]) == "销售明细", list(df.columns)
+
+    # 字典里没有这个文件 -> 仍然自动检测到第 3 行
+    c = _write_grid("hdr_unlisted.xlsx", [
+        ["说明文字", None],
+        [None, None],
+        ["姓名", "金额"],
+        ["王五", "300"],
+    ])
+    df2, logs = run([c], out="hdr_unlisted_out.xlsx", header_row={b: 1})
+    assert list(df2.columns)[:2] == ["姓名", "金额"], list(df2.columns)
+    assert any("未单独指定" in m for m in logs)
     print("  per-file header override          OK")
 
 
