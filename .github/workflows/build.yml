@@ -1,0 +1,35 @@
+name: Build Win7 EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.8 (32-bit)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+          architecture: 'x86'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed --name OfficeAutomationTool merge_gui.py
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: OfficeAutomationTool-win7
+          path: dist/OfficeAutomationTool.exe
