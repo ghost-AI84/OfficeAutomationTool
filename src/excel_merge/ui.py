@@ -31,6 +31,7 @@ from .logic import (
     SUPPORTED_EXTS,
     MergeCancelled,
     MergeOptions,
+    inspect_headers,
     merge_files,
 )
 
@@ -125,6 +126,13 @@ class MergeApp:
         self.v_autofit = tk.BooleanVar(value=s["autofit"])
         self.v_recursive = tk.BooleanVar(value=s["recursive"])
         self.v_sort_name = tk.BooleanVar(value=s["sort_by_name"])
+        self.v_merge_rows = tk.BooleanVar(value=s["merge_header_rows"])
+        self.v_drop_repeat = tk.BooleanVar(value=s["drop_repeated_headers"])
+        self.v_drop_summary = tk.BooleanVar(value=s["drop_summary_rows"])
+        self.v_fill_merged = tk.BooleanVar(value=s["fill_merged_cells"])
+
+        # 逐文件表头行（键是文件绝对路径，值是 1 基行号）
+        self.header_overrides = {}
 
         self.v_fuzzy = tk.BooleanVar(value=s["fuzzy"])
         self.v_case = tk.BooleanVar(value=s["case_sensitive"])
@@ -221,12 +229,17 @@ class MergeApp:
         self.header_entry = ttk.Entry(row, textvariable=self.v_header_row, width=6)
         self.header_entry.pack(side="left")
         ttk.Label(row, text="（从 1 开始）", foreground="#666").pack(side="left", padx=4)
+        ttk.Radiobutton(row, text="逐文件指定", variable=self.v_header_mode,
+                        value="perfile", command=self._sync_header_entry).pack(side="left", padx=(12, 4))
+        self.btn_header_dialog = ttk.Button(row, text="检测并调整…",
+                                            command=self.open_header_dialog)
+        self.btn_header_dialog.pack(side="left")
 
         row = ttk.Frame(tab)
         row.pack(fill="x", padx=8, pady=4)
         ttk.Label(row, text="工作表：").pack(side="left")
         ttk.Entry(row, textvariable=self.v_sheet, width=18).pack(side="left", padx=4)
-        ttk.Label(row, text="（0 = 第一个；也可填工作表名，仅 Excel 有效）",
+        ttk.Label(row, text="（0 = 第一个；auto = 自动挑有数据的表；也可填工作表名）",
                   foreground="#666").pack(side="left")
 
         row = ttk.Frame(tab)
@@ -269,11 +282,22 @@ class MergeApp:
         ttk.Checkbutton(row, text="丢弃全空列",
                         variable=self.v_drop_cols).pack(side="left", padx=(12, 0))
 
+        row = ttk.Frame(tab)
+        row.pack(fill="x", padx=8, pady=4)
+        ttk.Checkbutton(row, text="自动合并多行表头",
+                        variable=self.v_merge_rows).pack(side="left")
+        ttk.Checkbutton(row, text="填充合并单元格表头（xlsx）",
+                        variable=self.v_fill_merged).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(row, text="丢弃重复表头行",
+                        variable=self.v_drop_repeat).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(row, text="丢弃末尾合计行",
+                        variable=self.v_drop_summary).pack(side="left", padx=(12, 0))
+
         ttk.Label(
             tab, foreground="#666", wraplength=self._px(760), justify="left",
-            text="例：身份证 / 身份证号码 / 证件号码 视为同一列；"
-                 "金额(元)、总金额 归一为 金额；订单日期、交易时间 归一为 日期。"
-                 "对齐结果会逐条打印在日志里。",
+            text="表头行不在同一行、前面有标题或空行、两级表头（分组名是合并单元格）、"
+                 "分页导出夹着重复表头、末尾有合计行——这些都会自动处理。"
+                 "想确认或手工改，用「检测并调整…」。",
         ).pack(fill="x", padx=10, pady=(4, 8))
 
     def _build_advanced_tab(self, nb):
@@ -579,8 +603,12 @@ class MergeApp:
         if suffix not in OUTPUT_EXTS:
             raise ValueError("输出文件只支持 .xlsx 或 .csv 格式")
 
-        if self.v_header_mode.get() == "auto":
+        mode = self.v_header_mode.get()
+        if mode == "auto":
             header_row = None
+        elif mode == "perfile":
+            # 没调整过就退回自动检测
+            header_row = dict(self.header_overrides) or None
         else:
             try:
                 header_row = int(self.v_header_row.get().strip())
@@ -590,7 +618,9 @@ class MergeApp:
                 raise ValueError("表头行号必须是大于等于 1 的整数")
 
         sheet_raw = self.v_sheet.get().strip()
-        if sheet_raw in ("", "0"):
+        if sheet_raw.lower() == "auto":
+            sheet_name = "auto"
+        elif sheet_raw in ("", "0"):
             sheet_name = 0
         else:
             try:
@@ -642,6 +672,10 @@ class MergeApp:
             header_case_sensitive=self.v_case.get(),
             header_strip_punct=self.v_punct.get(),
             sort_by_name=self.v_sort_name.get(),
+            merge_header_rows="auto" if self.v_merge_rows.get() else 0,
+            drop_repeated_headers=self.v_drop_repeat.get(),
+            drop_summary_rows=self.v_drop_summary.get(),
+            fill_merged_header_cells=self.v_fill_merged.get(),
         )
         return options, warnings
 
@@ -782,6 +816,24 @@ class MergeApp:
         except OSError:
             pass
 
+    # ------------------------------------------------------------ 表头调整
+    def open_header_dialog(self):
+        if not self.files:
+            messagebox.showinfo("提示", "请先添加要合并的文件")
+            return
+        sheet_raw = self.v_sheet.get().strip()
+        sheet_name = 0 if sheet_raw in ("", "0") else sheet_raw
+        HeaderDialog(self, list(self.files), sheet_name, self.header_overrides)
+
+    def apply_header_overrides(self, overrides):
+        self.header_overrides = dict(overrides)
+        self.v_header_mode.set("perfile")
+        self._sync_header_entry()
+        if overrides:
+            rows = sorted(set(overrides.values()))
+            self._append_log("已按文件指定表头行：共 %d 个文件，行号 %s"
+                             % (len(overrides), rows), "ok")
+
     # ------------------------------------------------------------ 关闭
     def _persist_settings(self):
         s = self.settings
@@ -805,6 +857,10 @@ class MergeApp:
         s["date_in"] = self.v_date_in.get().strip()
         s["date_out"] = self.v_date_out.get().strip()
         s["sort_by_name"] = bool(self.v_sort_name.get())
+        s["merge_header_rows"] = bool(self.v_merge_rows.get())
+        s["drop_repeated_headers"] = bool(self.v_drop_repeat.get())
+        s["drop_summary_rows"] = bool(self.v_drop_summary.get())
+        s["fill_merged_cells"] = bool(self.v_fill_merged.get())
         out = self.v_output.get().strip()
         if out:
             s["output_dir"] = str(Path(out).parent)
@@ -838,6 +894,140 @@ def apply_default_fonts(root):
             except tk.TclError:
                 pass
         return
+
+
+class HeaderDialog(tk.Toplevel):
+    """逐文件表头行：显示自动检测结果，允许手工改正。"""
+
+    def __init__(self, app, files, sheet_name, overrides):
+        tk.Toplevel.__init__(self, app.root)
+        self.app = app
+        self.files = files
+        self.sheet_name = sheet_name
+        self.initial = dict(overrides)
+        self.rows = {}
+        self.queue = queue.Queue()
+
+        self.title("每文件表头行")
+        self.transient(app.root)
+        self.geometry("%dx%d" % (app._px(780), app._px(440)))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        ttk.Label(self, foreground="#555",
+                  text="下面是从各文件自动检测到的表头行；选中一行，在底部改成正确的行号。"
+                  ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+
+        wrap = ttk.Frame(self)
+        wrap.grid(row=1, column=0, sticky="nsew", padx=10)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(wrap, columns=("file", "row", "reason"),
+                                 show="headings", height=10)
+        self.tree.heading("file", text="文件")
+        self.tree.column("file", width=app._px(260))
+        self.tree.heading("row", text="表头行")
+        self.tree.column("row", width=app._px(70), anchor="center")
+        self.tree.heading("reason", text="依据")
+        self.tree.column("reason", width=app._px(380))
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+
+        bar = ttk.Frame(self)
+        bar.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
+        ttk.Label(bar, text="改为第").pack(side="left")
+        self.v_row = tk.StringVar()
+        ttk.Entry(bar, textvariable=self.v_row, width=6).pack(side="left", padx=4)
+        ttk.Label(bar, text="行").pack(side="left")
+        ttk.Button(bar, text="应用到选中", command=self._apply_selected).pack(side="left", padx=6)
+        ttk.Button(bar, text="全部设为该行", command=self._apply_all).pack(side="left")
+        ttk.Button(bar, text="确定", command=self._ok).pack(side="right")
+        ttk.Button(bar, text="取消", command=self.destroy).pack(side="right", padx=6)
+
+        self.status = ttk.Label(self, text="正在检测…", foreground="#666")
+        self.status.grid(row=3, column=0, sticky="w", padx=10, pady=(0, 8))
+
+        self.tree.bind("<Double-1>", self._on_double)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._poll()
+        threading.Thread(target=self._scan, daemon=True).start()
+
+    def _scan(self):
+        for path in self.files:
+            try:
+                info = inspect_headers(path, self.sheet_name)
+                row = info.row + 1
+                reason = info.reason
+            except Exception as e:
+                row, reason = 1, "读取失败：%s" % e
+            self.queue.put((path, row, reason))
+        self.queue.put(None)
+
+    def _poll(self):
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            while True:
+                item = self.queue.get_nowait()
+                if item is None:
+                    self.status.config(text="检测完成，共 %d 个文件" % len(self.files))
+                    continue
+                path, row, reason = item
+                base = self.initial.get(path)
+                if base:
+                    row = int(base)
+                self.rows[path] = int(row)
+                self.tree.insert("", "end", iid=path,
+                                 values=(Path(path).name, row, reason))
+        except queue.Empty:
+            pass
+        self.after(80, self._poll)
+
+    def _on_double(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.v_row.set(str(self.rows.get(item, "")))
+
+    def _read_row(self):
+        try:
+            row = int(self.v_row.get().strip())
+            if row < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("提示", "行号必须是大于等于 1 的整数", parent=self)
+            return None
+        return row
+
+    def _apply_selected(self):
+        row = self._read_row()
+        if row is None:
+            return
+        for item in self.tree.selection():
+            self.rows[item] = row
+            values = list(self.tree.item(item, "values"))
+            values[1] = row
+            self.tree.item(item, values=values)
+
+    def _apply_all(self):
+        row = self._read_row()
+        if row is None:
+            return
+        for item in self.tree.get_children():
+            self.rows[item] = row
+            values = list(self.tree.item(item, "values"))
+            values[1] = row
+            self.tree.item(item, values=values)
+
+    def _ok(self):
+        self.app.apply_header_overrides(self.rows)
+        self.destroy()
 
 
 def main():

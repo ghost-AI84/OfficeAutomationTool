@@ -21,9 +21,13 @@ DEFAULTS = {
     "last_dir": "",
     "output_dir": "",
     # 合并参数
-    "header_mode": "auto",       # auto / fixed
+    "header_mode": "auto",       # auto / fixed / perfile
     "header_row": 1,
     "sheet": "0",
+    "merge_header_rows": True,   # 多行表头自动合并
+    "drop_repeated_headers": True,
+    "drop_summary_rows": True,
+    "fill_merged_cells": True,
     "source_enabled": True,
     "source_position": "last",
     "source_name": "数据来源",

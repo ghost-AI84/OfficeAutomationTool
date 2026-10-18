@@ -127,6 +127,29 @@ class MergeOptions:
     header_case_sensitive: bool = False
     header_strip_punct: bool = False
     sort_by_name: bool = False      # 是否按文件名排序；默认保持调用方给的顺序
+    # 表头容错
+    merge_header_rows: object = "auto"   # "auto" / 0 / 1 / 2… 多行表头合并成几行
+    drop_repeated_headers: bool = True   # 丢弃数据区里重复出现的表头行
+    drop_summary_rows: bool = True       # 丢弃表格末尾的合计/小计行
+    fill_merged_header_cells: bool = True  # 合并单元格的表头向右填充（仅 xlsx）
+
+
+@dataclass
+class HeaderInfo:
+    """一张表的表头识别结果。"""
+
+    row: int                 # 主表头行（0 基）
+    extra_rows: int = 0      # 主表头上方还有几行属于表头（分组表头）
+    confidence: float = 0.0
+    reason: str = ""
+
+    @property
+    def first(self):
+        return max(0, self.row - self.extra_rows)
+
+    @property
+    def rows(self):
+        return list(range(self.first, self.row + 1))
 
 
 def _noop(*args, **kwargs):
@@ -357,33 +380,222 @@ def _read_raw(path, sheet_name=0):
     )
 
 
-def _detect_header_row(df, max_scan=20):
-    """智能打分识别表头：结合非空数量、文本占比、关键词命中"""
+def _detect_header_row(df, max_scan=30):
+    """旧接口：只返回行号。保留给外部调用，内部用 detect_header()。"""
+    return detect_header(df, max_scan=max_scan).row
+
+
+def _is_blank_value(v):
+    if v is None:
+        return True
+    if isinstance(v, float) and pd.isna(v):
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    return False
+
+
+def _row_profile(df, i):
+    """(非空数, 短文本数, 关键词命中, 最长文本长度)"""
+    row = df.iloc[i]
+    vals = [v for v in row if not _is_blank_value(v)]
+    texts = [_clean_text(v) for v in vals]
+    n = len(vals)
+    short = sum(1 for t in texts if len(t) <= 24 and not _NUMBER_RE.fullmatch(t))
+    keywords = sum(1 for t in texts if any(kw in t.lower() for kw in HEADER_KEYWORDS))
+    longest = max((len(t) for t in texts), default=0)
+    return n, short, keywords, longest
+
+
+def _header_score(profile):
+    n, short, keywords, longest = profile
+    score = n * 1.0 + short * 2.0 + keywords * 8.0
+    if n and short / n < 0.5:
+        score -= n            # 数字为主的行不像表头
+    if longest > 40:
+        score -= 6            # 长句更像标题/说明
+    return score
+
+
+def detect_header(df, max_scan=30):
+    """识别表头行，并判断上方是否还有一行分组表头。
+
+    返回 HeaderInfo：row 是主表头行（0 基），extra_rows 是它上方还有几行
+    属于表头，confidence 是"比第二名高多少"的比值，reason 写进日志。
+    """
     n = min(len(df), max_scan)
     if n == 0:
+        return HeaderInfo(0, 0, 0.0, "空表")
+
+    profiles = [(i, _row_profile(df, i)) for i in range(n)]
+    scored = [(i, _header_score(p)) for i, p in profiles if p[0] >= 1]
+    if not scored:
+        return HeaderInfo(0, 0, 0.0, "没有非空行")
+
+    best_score = max(s for _, s in scored)
+    # 分数接近时取最靠前的一行：标题/说明行往往分数明显低，不会进这个区间
+    near = [i for i, s in scored if s >= best_score * 0.95]
+    row = min(near)
+    second = max((s for i, s in scored if i != row), default=0)
+    confidence = 1.0 if second <= 0 else min(1.0, best_score / second)
+
+    # 多行表头：上一行只有少数几个短标签（分组名），且命中关键词
+    extra = 0
+    if row > 0:
+        above = profiles[row - 1][1]
+        below = profiles[row][1]
+        if 2 <= above[0] < below[0] and above[3] <= 12 and above[2] >= 1:
+            extra = 1
+
+    prof = profiles[row][1]
+    reason = "非空 %d 格 / 关键词 %d 个 / 最长 %d 字 / 置信度 %.2f" % (
+        prof[0], prof[2], prof[3], confidence)
+    return HeaderInfo(row, extra, confidence, reason)
+
+
+def _merged_cells_map(path, sheet_name, max_row):
+    """读取合并单元格，把左上角的值铺满整个合并区域（只取前 max_row 行）。"""
+    if path.suffix.lower() not in (".xlsx", ".xlsm"):
+        return {}
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return {}
+    try:
+        wb = load_workbook(str(path), data_only=True)
+        try:
+            if isinstance(sheet_name, str) and sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+            else:
+                idx = int(sheet_name or 0)
+                ws = wb.worksheets[idx] if 0 <= idx < len(wb.worksheets) else wb.worksheets[0]
+            out = {}
+            for rng in ws.merged_cells.ranges:
+                if rng.min_row > max_row:
+                    continue
+                value = ws.cell(row=rng.min_row, column=rng.min_col).value
+                for r in range(rng.min_row, min(rng.max_row, max_row) + 1):
+                    for c in range(rng.min_col, rng.max_col + 1):
+                        out[(r - 1, c - 1)] = value
+            return out
+        finally:
+            wb.close()
+    except Exception:
+        return {}
+
+
+def inspect_headers(path, sheet_name=0):
+    """给界面用：返回某个文件的表头识别结果。"""
+    p = Path(path)
+    sheet = _resolve_sheet(p, sheet_name)
+    raw = _read_raw(p, sheet_name=sheet)
+    if len(raw) == 0:
+        return HeaderInfo(0, 0, 0.0, "空表")
+    return detect_header(raw)
+
+
+def _row_has_merge(merged, row):
+    return any(r == row for r, _ in merged)
+
+
+def _looks_like_header_row(df, i):
+    """判断第 i 行是否像"子表头"：短文本为主、不是长句。"""
+    if i < 0 or i >= len(df):
+        return False
+    n, short, _keywords, longest = _row_profile(df, i)
+    if n < 2 or longest > 20:
+        return False
+    return short / float(n) >= 0.8
+
+
+def _combine_headers(raw, rows, merged=None):
+    """把多行表头按列拼成一个名字，空列返回 None。"""
+    width = raw.shape[1]
+    names = []
+    for j in range(width):
+        parts = []
+        for r in rows:
+            if merged and (r, j) in merged:
+                v = merged[(r, j)]
+            elif r < len(raw):
+                v = raw.iat[r, j]
+            else:
+                v = None
+            if _is_blank_value(v):
+                continue
+            text = _clean_text(v)
+            if text and text not in parts:
+                parts.append(text)
+        names.append("_".join(parts) if parts else None)
+    return names
+
+
+def _resolve_sheet(path, sheet_name, log=None):
+    """sheet_name == "auto" 时挑第一个有数据的工作表。"""
+    if sheet_name != "auto":
+        return sheet_name
+    ext = path.suffix.lower()
+    if ext == ".csv" or ext not in ENGINE_MAP:
         return 0
+    try:
+        xl = pd.ExcelFile(str(path), engine=ENGINE_MAP[ext])
+        names = list(xl.sheet_names)
+    except Exception:
+        return 0
+    for name in names:
+        try:
+            probe = pd.read_excel(str(path), sheet_name=name, header=None, nrows=30,
+                                  engine=ENGINE_MAP[ext], dtype=object)
+        except Exception:
+            continue
+        if len(probe) and int(probe.notna().sum().sum()) >= 3:
+            if log:
+                log("  自动选择工作表：" + str(name))
+            return name
+    return 0
 
-    scores = []
-    for i in range(n):
-        row = df.iloc[i]
-        nn = int(row.notna().sum())
-        vals = [str(v).lower() for v in row if pd.notna(v)]
 
-        # 1. 基础分：非空单元格数量
-        score = nn
+def _drop_repeated_header_rows(body, log):
+    """数据区里重复出现的表头行（分页导出常见）要丢掉。"""
+    if body.empty:
+        return body
+    hits = pd.Series(0, index=body.index, dtype="int64")
+    for col in body.columns:
+        key = _match_key(col)
+        hits = hits + body[col].map(
+            lambda v: int((not _is_blank_value(v)) and _match_key(v) == key)
+        ).astype("int64")
+    nonblank = body.notna().sum(axis=1).clip(lower=1)
+    mask = (hits >= 2) & (hits.astype("float64") / nonblank >= 0.8)
+    count = int(mask.sum())
+    if count:
+        log("  已丢弃 %d 行重复表头" % count)
+        return body[~mask].reset_index(drop=True)
+    return body
 
-        # 2. 文本分：表头通常是字符串
-        str_count = sum(1 for v in vals if v.strip())
-        if nn > 0:
-            score += (str_count / nn) * 5
 
-        # 3. 关键词分：命中常见表头关键词（极高权重）
-        keyword_hits = sum(1 for v in vals if any(kw in v for kw in HEADER_KEYWORDS))
-        score += keyword_hits * 10
+SUMMARY_KEYWORDS = ("合计", "小计", "总计", "汇总", "累计", "total", "subtotal")
 
-        scores.append(score)
 
-    return max(range(n), key=lambda i: scores[i])
+def _drop_summary_rows(body, log, tail=5):
+    """表格末尾的合计/小计行不是数据，丢掉。只检查最后几行，避免误删。"""
+    if body.empty:
+        return body
+    keep = [True] * len(body)
+    start = max(0, len(body) - tail)
+    for pos in range(start, len(body)):
+        row = body.iloc[pos]
+        vals = [v for v in row if not _is_blank_value(v)]
+        if not vals:
+            continue
+        first = _clean_text(vals[0]).lower()
+        if any(first == kw or first.startswith(kw) for kw in SUMMARY_KEYWORDS):
+            keep[pos] = False
+    dropped = keep.count(False)
+    if dropped:
+        log("  已丢弃 %d 行合计/汇总行" % dropped)
+        return body[keep].reset_index(drop=True)
+    return body
 
 
 # ---------------------------------------------------------------- 列宽自适应
@@ -523,8 +735,9 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
     frames, failed = [], []
     for idx, f in enumerate(candidates, start=1):
         check_cancel()
+        sheet = _resolve_sheet(f, options.sheet_name, log)
         try:
-            raw = _read_raw(f, sheet_name=options.sheet_name)
+            raw = _read_raw(f, sheet_name=sheet)
         except Exception as e:
             failed.append((f.name, repr(e)))
             log("[跳过] " + f.name + " 读取失败：" + str(e))
@@ -536,27 +749,51 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
             progress(idx, total)
             continue
 
-        # 表头行
+        # ---- 表头行：每个文件可以不一样 ----
+        info = None
         if options.header_row is None:
-            h = _detect_header_row(raw)
-            log("  自动检测表头：第 " + str(h + 1) + " 行")
+            info = detect_header(raw)
+            h = info.row
+            log("  自动检测表头：第 %d 行（%s）" % (h + 1, info.reason))
         elif isinstance(options.header_row, dict):
-            h = int(options.header_row.get(f.name, options.header_row.get(f.stem, 1))) - 1
+            value = options.header_row.get(str(f))
+            if value is None:
+                value = options.header_row.get(f.name)
+            if value is None:
+                value = options.header_row.get(f.stem, 1)
+            h = int(value) - 1
         else:
             h = int(options.header_row) - 1
         h = max(0, min(h, max(len(raw) - 1, 0)))
 
-        header_vals = raw.iloc[h].tolist()
+        # ---- 多行表头 ----
+        merged = {}
+        if options.fill_merged_header_cells:
+            merged = _merged_cells_map(f, sheet, min(len(raw), h + 3))
+
+        before = after = 0
+        if options.merge_header_rows == "auto":
+            if info is not None and info.extra_rows:
+                before = info.extra_rows
+            elif merged and _row_has_merge(merged, h) and _looks_like_header_row(raw, h + 1):
+                # 分组表头（合并单元格）+ 下一行子表头
+                after = 1
+        else:
+            before = max(0, int(options.merge_header_rows) - 1)
+        before = min(before, h)
+        after = min(after, max(len(raw) - h - 2, 0))
+        header_rows = list(range(h - before, h + after + 1))
+        header_label = (str(h + 1) if len(header_rows) == 1
+                        else "%d-%d" % (h - before + 1, h + after + 1))
+
+        names = _combine_headers(raw, header_rows, merged)
         cols = []
-        for j, name in enumerate(header_vals):
-            if name is None or name == "" or (isinstance(name, float) and pd.isna(name)):
-                cols.append("列" + str(j + 1))
-            else:
-                cols.append(name)
+        for j, name in enumerate(names):
+            cols.append(name if name else "列" + str(j + 1))
 
         final_cols = _unique_columns(cols)
 
-        body = raw.iloc[h + 1:].reset_index(drop=True)
+        body = raw.iloc[header_rows[-1] + 1:].reset_index(drop=True)
         body.columns = final_cols
 
         # ============ 表头对齐 ============
@@ -565,7 +802,7 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
             master_cols = list(final_cols)
             master_keys = [make_key(c) for c in final_cols]
             log("[" + str(idx) + "/" + str(total) + "] 已读取 " + f.name +
-                "  表头行=" + str(h + 1) +
+                "  表头行=" + header_label +
                 "  数据=" + str(body.shape[0]) + " 行 x " + str(body.shape[1]) + " 列")
             log("  该文件作为主表头，共 " + str(len(master_cols)) + " 列")
         else:
@@ -591,7 +828,7 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
                 body = body.rename(columns=rename_map)
 
             log("[" + str(idx) + "/" + str(total) + "] 已读取 " + f.name +
-                "  表头行=" + str(h + 1) +
+                "  表头行=" + header_label +
                 "  数据=" + str(body.shape[0]) + " 行 x " + str(body.shape[1]) + " 列")
 
             if matched_diff:
@@ -610,6 +847,12 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
 
         if options.drop_empty_rows:
             body = body.dropna(how="all").reset_index(drop=True)
+
+        # 分页导出会在中间重复表头；末尾常有合计行——都不是数据
+        if options.drop_repeated_headers:
+            body = _drop_repeated_header_rows(body, log)
+        if options.drop_summary_rows:
+            body = _drop_summary_rows(body, log)
 
         if options.drop_empty_cols:
             keep = [c for c in body.columns if not body[c].isna().all()]

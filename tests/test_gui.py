@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """界面测试：布局、校验、设置持久化、日志裁剪。
 
 需要可用的图形环境；无法创建窗口时自动跳过（返回 0），
@@ -17,6 +17,8 @@ os.environ["APPDATA"] = tempfile.mkdtemp(prefix="merge-appdata-")
 
 import tkinter as tk
 from tkinter import ttk
+
+import pandas as pd
 
 from excel_merge import config
 from excel_merge.logic import MergeOptions
@@ -68,7 +70,43 @@ def main():
     opts, warns = app._collect_options()
     assert isinstance(opts, MergeOptions)
     assert opts.header_row == 1 and opts.sheet_name == 0
+    assert opts.merge_header_rows == "auto"
+    assert opts.drop_repeated_headers and opts.drop_summary_rows
     print("  collect_options -> MergeOptions   OK")
+
+    # 3b. 逐文件指定表头行
+    app.v_header_mode.set("perfile")
+    app.header_overrides = {str(ROOT / "apps" / "merge_excel.py"): 3}
+    opts_pf, _ = app._collect_options()
+    assert opts_pf.header_row == {str(ROOT / "apps" / "merge_excel.py"): 3}, opts_pf.header_row
+    app.v_header_mode.set("fixed")
+    app._sync_header_entry()
+    print("  per-file header overrides         OK")
+
+    # 3c. 工作表 auto
+    app.v_sheet.set("auto")
+    opts_auto, _ = app._collect_options()
+    assert opts_auto.sheet_name == "auto", opts_auto.sheet_name
+    app.v_sheet.set("0")
+    print("  sheet=auto accepted               OK")
+
+    # 3d. 表头调整对话框：能打开、能检测、能回填
+    import time
+    from excel_merge.ui import HeaderDialog
+    demo = Path(tempfile.mkdtemp(prefix="hdr-dlg-")) / "demo.xlsx"
+    pd.DataFrame([["销售明细", None], [None, None],
+                  ["姓名", "金额"], ["张三", "100"]]).to_excel(demo, index=False, header=False)
+    dlg = HeaderDialog(app, [str(demo)], 0, {})
+    deadline = time.time() + 15
+    while time.time() < deadline and not dlg.tree.get_children():
+        root.update()
+        time.sleep(0.05)
+    assert dlg.tree.get_children(), "dialog did not populate"
+    dlg._ok()
+    root.update()
+    assert app.header_overrides, app.header_overrides
+    assert app.v_header_mode.get() == "perfile"
+    print("  header dialog detects and applies OK")
 
     # 4. 非法输出后缀
     app.v_output.set(str(Path(tempfile.gettempdir()) / "x.xls"))

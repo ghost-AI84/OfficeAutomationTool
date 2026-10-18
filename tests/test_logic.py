@@ -119,6 +119,116 @@ def test_source_column_name_clash():
     print("  source column name clash          OK")
 
 
+def _write_grid(name, rows):
+    """按原样写二维表（不设表头），返回路径。"""
+    path = WORK / name
+    with pd.ExcelWriter(path, engine="openpyxl") as w:
+        pd.DataFrame(rows).to_excel(w, index=False, header=False)
+    return str(path)
+
+
+def test_headers_at_different_rows():
+    """每个文件表头行不同：一个有标题有空格，一个直接是表头。"""
+    a = make("hdr_a.xlsx", ["姓名", "金额"], [["张三", "100"]])
+    b = _write_grid("hdr_b.xlsx", [
+        ["销售明细", None],
+        [None, None],
+        ["姓名", "金额"],
+        ["李四", "200"],
+    ])
+    df, logs = run([a, b], out="hdr_diff.xlsx", header_row=None)
+    assert list(df.columns)[:2] == ["姓名", "金额"], list(df.columns)
+    assert len(df) == 2, len(df)
+    assert any("自动检测表头" in m for m in logs)
+    print("  headers at different rows         OK")
+
+
+def test_per_file_header_override():
+    """逐文件指定表头行，优先于自动识别。"""
+    b = _write_grid("hdr_override.xlsx", [
+        ["销售明细", None],
+        [None, None],
+        ["姓名", "金额"],
+        ["李四", "200"],
+    ])
+    df, _ = run([b], out="hdr_override_out.xlsx", header_row={b: 1})
+    assert str(df.columns[0]) == "销售明细", list(df.columns)
+    print("  per-file header override          OK")
+
+
+def test_two_row_header_with_merged_cells():
+    """两级表头：分组名是合并单元格，下一行才是子表头。"""
+    from openpyxl import Workbook
+    path = WORK / "two_row.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "姓名"
+    ws["B1"] = "上半年"
+    ws.merge_cells("B1:C1")
+    ws["D1"] = "下半年"
+    ws.merge_cells("D1:E1")
+    for col, text in enumerate(["", "1月", "2月", "3月", "4月"], start=1):
+        if text:
+            ws.cell(row=2, column=col, value=text)
+    ws.append(["张三", "10", "20", "30", "40"])
+    ws.append(["李四", "11", "21", "31", "41"])
+    wb.save(path)
+
+    df, logs = run([str(path)], out="two_row_out.xlsx", header_row=None)
+    assert list(df.columns)[:5] == ["姓名", "上半年_1月", "上半年_2月",
+                                    "下半年_3月", "下半年_4月"], list(df.columns)
+    assert len(df) == 2, len(df)
+    assert "2-2" not in str(logs)
+    print("  two-row header + merged cells     OK")
+
+
+def test_drop_repeated_header_row():
+    """分页导出：数据中间又出现一次表头。"""
+    path = _write_grid("repeat_hdr.xlsx", [
+        ["姓名", "金额"],
+        ["张三", "100"],
+        ["姓名", "金额"],
+        ["李四", "200"],
+    ])
+    df, logs = run([str(path)], out="repeat_hdr_out.xlsx", header_row=None)
+    assert len(df) == 2, len(df)
+    assert any("重复表头" in m for m in logs)
+    print("  repeated header row dropped       OK")
+
+
+def test_drop_summary_row():
+    """末尾合计行不该进入结果。"""
+    path = _write_grid("summary.xlsx", [
+        ["姓名", "金额"],
+        ["张三", "100"],
+        ["李四", "200"],
+        ["合计", "300"],
+    ])
+    df, logs = run([str(path)], out="summary_out.xlsx", header_row=None)
+    assert len(df) == 2, len(df)
+    assert any("合计" in m for m in logs)
+    print("  summary row dropped               OK")
+
+
+def test_sheet_auto():
+    """sheet_name='auto' 时跳过空的说明页，选有数据的表。"""
+    from openpyxl import Workbook
+    path = WORK / "sheets.xlsx"
+    wb = Workbook()
+    note = wb.active
+    note.title = "说明"
+    note["A1"] = "本表仅供内部使用"
+    data = wb.create_sheet("数据")
+    data.append(["姓名", "金额"])
+    data.append(["张三", "100"])
+    wb.save(path)
+
+    df, logs = run([str(path)], out="sheets_out.xlsx", header_row=None, sheet_name="auto")
+    assert list(df.columns)[:2] == ["姓名", "金额"], list(df.columns)
+    assert any("自动选择工作表" in m for m in logs)
+    print("  sheet auto-pick                   OK")
+
+
 TESTS = [
     test_order_defines_master_header,
     test_sort_by_name,
@@ -128,6 +238,12 @@ TESTS = [
     test_auto_header_detection,
     test_drop_empty_rows_and_cols,
     test_source_column_name_clash,
+    test_headers_at_different_rows,
+    test_per_file_header_override,
+    test_two_row_header_with_merged_cells,
+    test_drop_repeated_header_row,
+    test_drop_summary_row,
+    test_sheet_auto,
 ]
 
 
