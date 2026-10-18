@@ -7,3 +7,8 @@ build/
 *.spec
 .idea/
 .vscode/
+
+# 下载/归档的成品 exe：不进 git，用 GitHub Releases 或 Actions artifact 分发
+releases/
+*.part
+.pytest_cache/

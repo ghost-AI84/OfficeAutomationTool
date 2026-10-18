@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# 只有打包才需要，最终用户不用装
+pyinstaller==4.10
