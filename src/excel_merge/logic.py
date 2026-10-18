@@ -902,8 +902,10 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
     out_path.parent.mkdir(parents=True, exist_ok=True)
     log("正在写入文件：" + str(out_path))
 
-    # 先写 .part 再原子替换：中途失败或取消不会留下半截文件
-    tmp_path = out_path.with_name(out_path.name + ".part")
+    # 先写临时文件再原子替换：中途失败或取消不会留下半截文件。
+    # 临时文件必须保留正确的扩展名——openpyxl 的 load_workbook 按扩展名判断格式，
+    # 用 ".xlsx.part" 会直接抛 InvalidFileException，列宽调整就静默失效了。
+    tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
     try:
         if out_path.suffix.lower() == ".csv":
             merged.to_csv(tmp_path, index=False, encoding="utf-8-sig")

@@ -66,7 +66,8 @@ def test_cancel_leaves_no_output():
     except MergeCancelled:
         pass
     assert not out.exists()
-    assert not (WORK / "cancelled.xlsx.part").exists()
+    assert not list(WORK.glob("cancelled*.part"))
+    assert not list(WORK.glob("cancelled*tmp*"))
     print("  cancel + no leftovers             OK")
 
 
@@ -75,7 +76,7 @@ def test_csv_and_source_first():
     df, _ = run([f], out="out.csv", source_position="first")
     assert list(df.columns)[0] == "数据来源", list(df.columns)
     assert (WORK / "out.csv").exists()
-    assert not (WORK / "out.csv.part").exists()
+    assert not list(WORK.glob("out.csv.*"))
     print("  csv output + source first         OK")
 
 
@@ -222,7 +223,6 @@ def test_drop_summary_row():
 
 
 def test_sheet_auto():
-    """sheet_name='auto' 时跳过空的说明页，选有数据的表。"""
     from openpyxl import Workbook
     path = WORK / "sheets.xlsx"
     wb = Workbook()
@@ -240,6 +240,21 @@ def test_sheet_auto():
     print("  sheet auto-pick                   OK")
 
 
+def test_autofit_column_widths():
+    """列宽自适应必须真的写进文件（曾经因为临时文件扩展名被静默跳过）。"""
+    from openpyxl import load_workbook
+    f = make("width.xlsx", ["姓名", "身份证号码", "备注"],
+             [["张三", "110101199001011234", "一段比较长的备注文字内容"]])
+    out = WORK / "width_out.xlsx"
+    run([f], out="width_out.xlsx")
+    ws = load_workbook(out).active
+    widths = [ws.column_dimensions[c].width for c in ("A", "B", "C")]
+    assert widths[1] > 13, widths      # 身份证号列应明显宽于默认 13
+    assert widths[2] > 13, widths
+    assert widths[0] >= 8, widths      # 最小宽度
+    print("  autofit writes column widths      OK  %s" % [round(w, 1) for w in widths])
+
+
 TESTS = [
     test_order_defines_master_header,
     test_sort_by_name,
@@ -255,6 +270,7 @@ TESTS = [
     test_drop_repeated_header_row,
     test_drop_summary_row,
     test_sheet_auto,
+    test_autofit_column_widths,
 ]
 
 
