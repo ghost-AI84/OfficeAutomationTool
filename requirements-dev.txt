@@ -1,4 +1,7 @@
 -r requirements.txt
 
-# 只有打包才需要，最终用户不用装
-pyinstaller==4.10
+# 只有打包才需要，最终用户不用装。
+# 不能用 4.10：它的引导程序在较新的 Windows 上创建不了 _MEI 临时目录，
+# 双击 exe 会直接弹 "cannot create temporary directory"。6.11.1 仍支持
+# Python 3.8 和 Windows 7，且属于 6.x 引导程序线。
+pyinstaller==6.11.1
