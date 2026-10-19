@@ -285,6 +285,41 @@ def test_all_sheets_in_one_workbook():
     print("  default single-sheet unchanged    OK")
 
 
+def _inject_text_autofilter(path):
+    """给工作表塞一个"文字型自定义筛选"，复现 openpyxl 3.1.2 的解析崩溃。"""
+    import shutil
+    import zipfile
+
+    tmp = path.with_suffix(".tmp.xlsx")
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                text = data.decode("utf-8")
+                if "<autoFilter" not in text:
+                    # 必须包在 filterColumn 里，否则 openpyxl 不会解析这段
+                    flt = ('<autoFilter ref="A1:B3"><filterColumn colId="0">'
+                           '<customFilters><customFilter operator="equal" val="张三"/>'
+                           '</customFilters></filterColumn></autoFilter>')
+                    text = text.replace("</sheetData>", "</sheetData>" + flt)
+                data = text.encode("utf-8")
+            zout.writestr(item, data)
+    shutil.move(str(tmp), str(path))
+
+
+def test_text_autofilter_workbook_is_readable():
+    """带文字型自动筛选的表要能读——openpyxl 3.1.2 会直接 ValueError。"""
+    path = WORK / "autofilter.xlsx"
+    pd.DataFrame([["姓名", "金额"], ["张三", "100"], ["李四", "200"]]).to_excel(
+        path, index=False, header=False)
+    _inject_text_autofilter(path)
+
+    df, _ = run([str(path)], out="autofilter_out.xlsx", header_row=None)
+    assert list(df.columns)[:2] == ["姓名", "金额"], list(df.columns)
+    assert len(df) == 2, len(df)
+    print("  text autofilter workbook          OK")
+
+
 TESTS = [
     test_order_defines_master_header,
     test_sort_by_name,
@@ -302,6 +337,7 @@ TESTS = [
     test_sheet_auto,
     test_autofit_column_widths,
     test_all_sheets_in_one_workbook,
+    test_text_autofilter_workbook_is_readable,
 ]
 
 
