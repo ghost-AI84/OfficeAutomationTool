@@ -734,6 +734,7 @@ class MergeApp:
 
         self._append_log("=" * 60, "dim")
         self._append_log("开始合并 %d 个文件 ..." % len(self.files), "info")
+        self._append_log("工作表：%s" % self.v_sheet.get(), "dim")
 
         self.cancel_event = threading.Event()
         files = list(self.files)

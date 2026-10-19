@@ -20,10 +20,12 @@ DEFAULTS = {
     # 界面
     "last_dir": "",
     "output_dir": "",
+    "settings_version": 2,
     # 合并参数
     "header_mode": "auto",       # auto / fixed / perfile
     "header_row": 1,
-    "sheet": "0",
+    # 默认按子表分组合并：工作簿里有多个子表时，同名/相似子表各成一组
+    "sheet": "all",
     "merge_header_rows": True,   # 多行表头自动合并
     "drop_repeated_headers": True,
     "drop_summary_rows": True,
@@ -77,6 +79,13 @@ def load_settings():
                     data[key] = default
             else:
                 data[key] = str(value)
+
+        # v2：默认改成"所有子表（按名字分组）"。
+        # 旧版本存下来的 0/空值多半是没改过默认，一并迁移，否则体验不到分组。
+        if int(stored.get("settings_version", 1) or 1) < 2:
+            if data.get("sheet") in ("0", ""):
+                data["sheet"] = "all"
+            data["settings_version"] = 2
     return data
 
 

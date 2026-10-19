@@ -42,6 +42,10 @@ def main():
     root.update_idletasks()
     print("  scale=%.2f  minsize=%s" % (app.scale, root.minsize()))
 
+    # 0. 默认就应该是"所有子表（按名字分组）"，不能让用户去猜
+    assert app.v_sheet.get() == "所有子表（按名字分组）", app.v_sheet.get()
+    print("  default sheet mode is grouped      OK")
+
     # 1. 最小尺寸下关键控件必须可见
     mw, mh = root.minsize()
     root.geometry("%dx%d" % (mw, mh))
@@ -69,7 +73,7 @@ def main():
     app.v_output.set(str(Path(tempfile.gettempdir()) / "x.xlsx"))
     opts, warns = app._collect_options()
     assert isinstance(opts, MergeOptions)
-    assert opts.header_row == 1 and opts.sheet_name == 0
+    assert opts.header_row == 1 and opts.sheet_name == "all"
     assert opts.merge_header_rows == "auto"
     assert opts.drop_repeated_headers and opts.drop_summary_rows
     print("  collect_options -> MergeOptions   OK")
