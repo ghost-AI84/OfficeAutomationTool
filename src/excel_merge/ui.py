@@ -239,7 +239,7 @@ class MergeApp:
         row.pack(fill="x", padx=8, pady=4)
         ttk.Label(row, text="工作表：").pack(side="left")
         ttk.Entry(row, textvariable=self.v_sheet, width=18).pack(side="left", padx=4)
-        ttk.Label(row, text="（0 = 第一个；auto = 自动挑有数据的表；all = 所有子表；也可填表名）",
+        ttk.Label(row, text="（0 = 第一个；auto = 自动挑有数据的表；all = 按子表分组合并；也可填表名）",
                   foreground="#666").pack(side="left")
 
         row = ttk.Frame(tab)

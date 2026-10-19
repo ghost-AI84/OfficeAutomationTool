@@ -24,11 +24,18 @@ def make(name, headers, rows):
     return str(path)
 
 
-def run(files, **kw):
+def merge_groups(files, **kw):
+    """返回完整结果：工作表名 -> DataFrame。"""
     opts = MergeOptions(output_path=str(WORK / kw.pop("out", "out.xlsx")), **kw)
     logs = []
-    df = merge_files(files, opts, log_callback=logs.append)
-    return df, logs
+    result = merge_files(files, opts, log_callback=logs.append)
+    return result, logs
+
+
+def run(files, **kw):
+    """只取第一张（单表模式下就是唯一一张）用于断言。"""
+    result, logs = merge_groups(files, **kw)
+    return next(iter(result.values())), logs
 
 
 def test_order_defines_master_header():
@@ -256,32 +263,47 @@ def test_autofit_column_widths():
 
 
 def test_all_sheets_in_one_workbook():
-    """一个工作簿里有多个子表：每张表单独识别、合并成一段数据。"""
-    from openpyxl import Workbook
-    path = WORK / "multi_sheet.xlsx"
-    wb = Workbook()
-    wb.remove(wb.active)
-    for name in ("1月", "2月", "说明"):
-        ws = wb.create_sheet(name)
-        if name == "说明":
-            ws["A1"] = "本表为说明"
-            continue
-        ws.append(["姓名", "金额"])
-        ws.append([name + "甲", "100"])
-        ws.append([name + "乙", "200"])
-    wb.save(path)
+    """多个子表按名字分组：附件1 与附件1 合并，附件2 与附件2 合并，各成一个 sheet。"""
+    from openpyxl import Workbook, load_workbook
 
-    df, logs = run([str(path)], out="multi_sheet_out.xlsx",
-                   sheet_name="all", header_row=None)
-    assert len(df) == 4, len(df)
-    assert set(df["数据来源"]) == {"multi_sheet/1月", "multi_sheet/2月"}, \
-        df["数据来源"].tolist()
-    assert any("跳过空工作表" in m or "说明" in m for m in logs)
-    print("  all sheets in one workbook        OK")
+    def build(filename, rows1, rows2):
+        p = WORK / filename
+        wb = Workbook()
+        wb.remove(wb.active)
+        ws1 = wb.create_sheet("附件1")
+        ws1.append(["姓名", "金额"])
+        for r in rows1:
+            ws1.append(r)
+        ws2 = wb.create_sheet("附件2")
+        ws2.append(["单位", "数量"])
+        for r in rows2:
+            ws2.append(r)
+        note = wb.create_sheet("说明")
+        note["A1"] = "本表仅为说明"
+        wb.save(p)
+        return str(p)
+
+    a = build("multi_a.xlsx", [["甲", "100"]], [["A局", "5"]])
+    b = build("multi_b.xlsx", [["乙", "200"]], [["B局", "7"]])
+
+    out = WORK / "multi_grouped.xlsx"
+    groups, logs = merge_groups([a, b], out="multi_grouped.xlsx",
+                                sheet_name="all", header_row=None)
+
+    assert list(groups.keys()) == ["附件1", "附件2"], list(groups.keys())
+    assert len(groups["附件1"]) == 2, len(groups["附件1"])
+    assert len(groups["附件2"]) == 2, len(groups["附件2"])
+    assert list(groups["附件1"].columns)[:2] == ["姓名", "金额"]
+    assert list(groups["附件2"].columns)[:2] == ["单位", "数量"]
+    assert any("跳过空工作表" in m for m in logs)
+
+    wb = load_workbook(out)
+    assert wb.sheetnames == ["附件1", "附件2"], wb.sheetnames
+    print("  sheets grouped by name            OK  %s" % wb.sheetnames)
 
     # 默认（只读第一张）仍然可用，不破坏原行为
-    df2, _ = run([str(path)], out="multi_sheet_one.xlsx", header_row=None)
-    assert len(df2) == 2, len(df2)
+    df2, _ = run([a], out="multi_single.xlsx", header_row=None)
+    assert len(df2) == 1, len(df2)
     print("  default single-sheet unchanged    OK")
 
 

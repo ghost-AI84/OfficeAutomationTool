@@ -18,6 +18,7 @@ import os
 import re
 import unicodedata
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -659,7 +660,7 @@ def _cell_display_width(v):
     return w
 
 
-def _autofit_excel_columns(path, sheet_name="汇总",
+def _autofit_excel_columns(path, sheet_name=None,
                            min_width=8, max_width=60,
                            padding=3.0, sample_rows=2000):
     try:
@@ -673,29 +674,47 @@ def _autofit_excel_columns(path, sheet_name="汇总",
     except Exception:
         return
 
-    if sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
+    if sheet_name is not None and sheet_name in wb.sheetnames:
+        sheets = [wb[sheet_name]]
     else:
-        ws = wb.active
+        sheets = wb.worksheets
 
-    n_rows = min(ws.max_row, sample_rows + 1)
-    n_cols = ws.max_column
+    for ws in sheets:
+        n_rows = min(ws.max_row, sample_rows + 1)
+        n_cols = ws.max_column
 
-    for c in range(1, n_cols + 1):
-        letter = get_column_letter(c)
-        max_len = 0
-        for r in range(1, n_rows + 1):
-            v = ws.cell(row=r, column=c).value
-            w = _cell_display_width(v)
-            if w > max_len:
-                max_len = w
-        width = max(min_width, min(max_width, max_len + padding))
-        ws.column_dimensions[letter].width = width
+        for c in range(1, n_cols + 1):
+            letter = get_column_letter(c)
+            max_len = 0
+            for r in range(1, n_rows + 1):
+                v = ws.cell(row=r, column=c).value
+                w = _cell_display_width(v)
+                if w > max_len:
+                    max_len = w
+            width = max(min_width, min(max_width, max_len + padding))
+            ws.column_dimensions[letter].width = width
 
     try:
         wb.save(path)
     except Exception:
         pass
+
+
+_INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\]")
+
+
+def _safe_sheet_name(name, used):
+    """Excel 工作表名：去掉非法字符、截断 31 字、重名自动加后缀。"""
+    base = _INVALID_SHEET_CHARS.sub("_", str(name)).strip() or "Sheet"
+    base = base[:31]
+    candidate = base
+    i = 2
+    while candidate.lower() in used:
+        suffix = "_" + str(i)
+        candidate = base[:31 - len(suffix)] + suffix
+        i += 1
+    used.add(candidate.lower())
+    return candidate
 
 
 def _unique_columns(cols):
@@ -715,10 +734,14 @@ def _unique_columns(cols):
 
 def merge_files(files, options, log_callback=None, progress_callback=None,
                 cancel_event=None):
-    """按 options 合并 files，返回合并后的 DataFrame。
+    """按 options 合并 files，返回 OrderedDict：工作表名 -> DataFrame。
 
-    files 的顺序会被原样保留（除非 options.sort_by_name），第一个成功读取的
-    文件决定主表头。
+    - 工作表填 0 / 序号 / 名称：只有一个结果，键为 None（写成「汇总」）
+    - 工作表填 all：**按子表名分组**，同名子表各自合并，输出成多个工作表
+      （附件1 和附件2 内容不同，不会混到一张表里）
+
+    files 的顺序原样保留（除非 options.sort_by_name）；每个分组里第一个
+    成功读取的文件决定该组的主表头。
     """
     if not isinstance(options, MergeOptions):
         raise TypeError("options 必须是 MergeOptions 实例")
@@ -749,26 +772,26 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
     if not candidates:
         raise ValueError("没有可用的输入文件")
 
-    # 把"文件"展开成"文件里的每一张子表"：每张表单独识别表头，各自成段
-    units = []
-    for f in candidates:
-        sheets = _sheet_list(f, options.sheet_name, log)
-        multi = len(sheets) > 1
-        for label, param in sheets:
-            if multi and label is not None:
-                source_value = f.stem + "/" + str(label)
-            else:
-                source_value = f.stem
-            units.append((f, label, param, source_value))
-    if not units:
+    # ---- 分组：all 时按子表名分组，其余情况所有文件共用一个分组 ----
+    groups = OrderedDict()
+    if options.sheet_name == "all":
+        for f in candidates:
+            for label, param in _sheet_list(f, options.sheet_name, log):
+                key = str(label) if label is not None else "Sheet1"
+                groups.setdefault(key, []).append((f, label, param))
+    else:
+        units = []
+        for f in candidates:
+            label, param = _sheet_list(f, options.sheet_name, log)[0]
+            units.append((f, label, param))
+        groups[None] = units
+
+    if not groups:
         raise ValueError("没有可用的工作表")
 
-    total = len(units)
+    total = sum(len(v) for v in groups.values())
     progress(0, total)
     check_cancel()
-
-    master_cols = []
-    master_keys = []
 
     def make_key(name):
         if not options.fuzzy_header_match:
@@ -780,186 +803,178 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
         )
 
     force_types = options.force_types or {}
+    results = OrderedDict()
+    failed = []
+    done = 0
 
-    frames, failed = [], []
-    for idx, (f, sheet_label, sheet_param, source_value) in enumerate(units, start=1):
-        check_cancel()
-        sheet = sheet_param
-        display = f.name if sheet_label is None else "%s/%s" % (f.name, sheet_label)
-        if sheet_label is not None:
-            log("[" + str(idx) + "/" + str(total) + "] 读取 " + f.name +
-                " 的「" + str(sheet_label) + "」表")
-        try:
-            raw = _read_raw(f, sheet_name=sheet)
-        except Exception as e:
-            failed.append((f.name, repr(e)))
-            log("[跳过] " + f.name +
-                (" / " + str(sheet_label) if sheet_label else "") +
-                " 读取失败：" + str(e))
-            progress(idx, total)
-            continue
+    for group_name, units in groups.items():
+        master_cols, master_keys = [], []
+        frames = []
 
-        if len(raw) == 0:
-            log("[跳过] " + display + " 内容为空")
-            progress(idx, total)
-            continue
+        for (f, sheet_label, sheet_param) in units:
+            check_cancel()
+            done += 1
+            display = f.name if sheet_label is None else "%s/%s" % (f.name, sheet_label)
+            if sheet_label is not None:
+                log("[%d/%d] 读取 %s 的「%s」表" % (done, total, f.name, sheet_label))
 
-        # ---- 表头行：每个文件可以不一样 ----
-        info = None
-        if options.header_row is None:
-            info = detect_header(raw)
-            h = info.row
-            log("  自动检测表头：第 %d 行（%s）" % (h + 1, info.reason))
-        elif isinstance(options.header_row, dict):
-            value = options.header_row.get(str(f))
-            if value is None:
-                value = options.header_row.get(f.name)
-            if value is None:
-                value = options.header_row.get(f.stem)
-            if value is None:
-                # 调整后又新增的文件：没有指定就回到自动检测
+            try:
+                raw = _read_raw(f, sheet_name=sheet_param)
+            except Exception as e:
+                failed.append((display, repr(e)))
+                log("[跳过] " + display + " 读取失败：" + str(e))
+                progress(done, total)
+                continue
+
+            if len(raw) == 0:
+                log("[跳过] " + display + " 内容为空")
+                progress(done, total)
+                continue
+
+            # ---- 表头行：每个文件可以不一样 ----
+            info = None
+            if options.header_row is None:
                 info = detect_header(raw)
                 h = info.row
-                log("  未单独指定，自动检测表头：第 %d 行" % (h + 1))
-            else:
-                h = int(value) - 1
-        else:
-            h = int(options.header_row) - 1
-        h = max(0, min(h, max(len(raw) - 1, 0)))
-
-        # ---- 多行表头 ----
-        merged = {}
-        if options.fill_merged_header_cells:
-            merged = _merged_cells_map(f, sheet, min(len(raw), h + 3))
-
-        before = after = 0
-        if options.merge_header_rows == "auto":
-            if info is not None and info.extra_rows:
-                before = info.extra_rows
-            elif merged and _row_has_merge(merged, h) and _looks_like_header_row(raw, h + 1):
-                # 分组表头（合并单元格）+ 下一行子表头
-                after = 1
-        else:
-            before = max(0, int(options.merge_header_rows) - 1)
-        before = min(before, h)
-        after = min(after, max(len(raw) - h - 2, 0))
-        header_rows = list(range(h - before, h + after + 1))
-        header_label = (str(h + 1) if len(header_rows) == 1
-                        else "%d-%d" % (h - before + 1, h + after + 1))
-
-        names = _combine_headers(raw, header_rows, merged)
-        cols = []
-        for j, name in enumerate(names):
-            cols.append(name if name else "列" + str(j + 1))
-
-        final_cols = _unique_columns(cols)
-
-        body = raw.iloc[header_rows[-1] + 1:].reset_index(drop=True)
-        body.columns = final_cols
-
-        # ============ 表头对齐 ============
-        if not master_cols:
-            # 第一个文件：作为主表头
-            master_cols = list(final_cols)
-            master_keys = [make_key(c) for c in final_cols]
-            log("[" + str(idx) + "/" + str(total) + "] 已读取 " + display +
-                "  表头行=" + header_label +
-                "  数据=" + str(body.shape[0]) + " 行 x " + str(body.shape[1]) + " 列")
-            log("  该文件作为主表头，共 " + str(len(master_cols)) + " 列")
-        else:
-            key_to_master = {}
-            for i, k in enumerate(master_keys):
-                if k and k not in key_to_master:
-                    key_to_master[k] = master_cols[i]
-
-            rename_map = {}
-            matched_diff = []     # 记录"字面不同但被匹配为同一列"的表头
-            extra_cols = []
-            for c in final_cols:
-                k = make_key(c)
-                if k and k in key_to_master:
-                    target = key_to_master[k]
-                    if str(c) != str(target):
-                        rename_map[c] = target
-                        matched_diff.append((str(c), str(target)))
+                log("  自动检测表头：第 %d 行（%s）" % (h + 1, info.reason))
+            elif isinstance(options.header_row, dict):
+                value = options.header_row.get(str(f))
+                if value is None:
+                    value = options.header_row.get(f.name)
+                if value is None:
+                    value = options.header_row.get(f.stem)
+                if value is None:
+                    info = detect_header(raw)
+                    h = info.row
+                    log("  未单独指定，自动检测表头：第 %d 行" % (h + 1))
                 else:
-                    extra_cols.append(c)
-
-            if rename_map:
-                body = body.rename(columns=rename_map)
-
-            log("[" + str(idx) + "/" + str(total) + "] 已读取 " + display +
-                "  表头行=" + header_label +
-                "  数据=" + str(body.shape[0]) + " 行 x " + str(body.shape[1]) + " 列")
-
-            if matched_diff:
-                log("  表头对齐（智能匹配，视为同一列）：")
-                for src, dst in matched_diff:
-                    log("    " + repr(src) + "  ->  " + repr(dst))
-
-            if extra_cols:
-                log("  注意：出现主表头之外的新列 " + str(extra_cols) +
-                    "，已追加到表头末尾")
-                master_cols = master_cols + extra_cols
-                master_keys = master_keys + [make_key(c) for c in extra_cols]
-
-        # 按主表头顺序重排（缺的列补 NaN）
-        body = body.reindex(columns=master_cols)
-
-        if options.drop_empty_rows:
-            body = body.dropna(how="all").reset_index(drop=True)
-
-        # 分页导出会在中间重复表头；末尾常有合计行——都不是数据
-        if options.drop_repeated_headers:
-            body = _drop_repeated_header_rows(body, log)
-        if options.drop_summary_rows:
-            body = _drop_summary_rows(body, log)
-
-        if len(body) == 0:
-            log("  该表没有数据行，已跳过")
-            progress(idx, total)
-            continue
-
-        if options.drop_empty_cols:
-            keep = [c for c in body.columns if not body[c].isna().all()]
-            body = body[keep]
-            master_cols = keep
-            master_keys = [make_key(c) for c in keep]
-
-        # 数据格式统一
-        if options.unify_formats and len(body) > 0:
-            force = {}
-            for k, v in force_types.items():
-                kk = make_key(k)
-                for c in body.columns:
-                    if make_key(c) == kk:
-                        force[c] = v
-            body = normalize_dataframe(body, date_format=options.date_format, force_types=force)
-
-        # 来源列
-        if options.add_source_column:
-            name = options.source_column_name or "数据来源"
-            if name in body.columns:      # 避免与原表同名列冲突
-                body = body.drop(columns=[name])
-            if options.source_position == "first":
-                body.insert(0, name, source_value)
+                    h = int(value) - 1
             else:
-                body[name] = source_value
+                h = int(options.header_row) - 1
+            h = max(0, min(h, max(len(raw) - 1, 0)))
 
-        frames.append(body)
-        progress(idx, total)
+            # ---- 多行表头 ----
+            merged_cells = {}
+            if options.fill_merged_header_cells:
+                merged_cells = _merged_cells_map(f, sheet_param, min(len(raw), h + 3))
 
-    if not frames:
+            before = after = 0
+            if options.merge_header_rows == "auto":
+                if info is not None and info.extra_rows:
+                    before = info.extra_rows
+                elif (merged_cells and _row_has_merge(merged_cells, h)
+                      and _looks_like_header_row(raw, h + 1)):
+                    after = 1
+            else:
+                before = max(0, int(options.merge_header_rows) - 1)
+            before = min(before, h)
+            after = min(after, max(len(raw) - h - 2, 0))
+            header_rows = list(range(h - before, h + after + 1))
+            header_label = (str(h + 1) if len(header_rows) == 1
+                            else "%d-%d" % (h - before + 1, h + after + 1))
+
+            names = _combine_headers(raw, header_rows, merged_cells)
+            cols = [name if name else "列" + str(j + 1) for j, name in enumerate(names)]
+            final_cols = _unique_columns(cols)
+
+            body = raw.iloc[header_rows[-1] + 1:].reset_index(drop=True)
+            body.columns = final_cols
+
+            # ============ 表头对齐 ============
+            if not master_cols:
+                master_cols = list(final_cols)
+                master_keys = [make_key(c) for c in final_cols]
+                log("  表头行=%s  数据=%d 行 x %d 列" % (header_label, body.shape[0], body.shape[1]))
+                log("  该表作为本组主表头，共 %d 列" % len(master_cols))
+            else:
+                key_to_master = {}
+                for i, k in enumerate(master_keys):
+                    if k and k not in key_to_master:
+                        key_to_master[k] = master_cols[i]
+
+                rename_map = {}
+                matched_diff = []
+                extra_cols = []
+                for c in final_cols:
+                    k = make_key(c)
+                    if k and k in key_to_master:
+                        target = key_to_master[k]
+                        if str(c) != str(target):
+                            rename_map[c] = target
+                            matched_diff.append((str(c), str(target)))
+                    else:
+                        extra_cols.append(c)
+
+                if rename_map:
+                    body = body.rename(columns=rename_map)
+
+                log("  表头行=%s  数据=%d 行 x %d 列" % (header_label, body.shape[0], body.shape[1]))
+
+                if matched_diff:
+                    log("  表头对齐（智能匹配，视为同一列）：")
+                    for src, dst in matched_diff:
+                        log("    " + repr(src) + "  ->  " + repr(dst))
+
+                if extra_cols:
+                    log("  注意：出现主表头之外的新列 " + str(extra_cols) +
+                        "，已追加到表头末尾")
+                    master_cols = master_cols + extra_cols
+                    master_keys = master_keys + [make_key(c) for c in extra_cols]
+
+            # 按主表头顺序重排（缺的列补 NaN）
+            body = body.reindex(columns=master_cols)
+
+            if options.drop_empty_rows:
+                body = body.dropna(how="all").reset_index(drop=True)
+
+            if options.drop_repeated_headers:
+                body = _drop_repeated_header_rows(body, log)
+            if options.drop_summary_rows:
+                body = _drop_summary_rows(body, log)
+
+            if len(body) == 0:
+                log("  该表没有数据行，已跳过")
+                progress(done, total)
+                continue
+
+            if options.drop_empty_cols:
+                keep = [c for c in body.columns if not body[c].isna().all()]
+                body = body[keep]
+                master_cols = keep
+                master_keys = [make_key(c) for c in keep]
+
+            if options.unify_formats and len(body) > 0:
+                force = {}
+                for k, v in force_types.items():
+                    kk = make_key(k)
+                    for c in body.columns:
+                        if make_key(c) == kk:
+                            force[c] = v
+                body = normalize_dataframe(body, date_format=options.date_format,
+                                           force_types=force)
+
+            if options.add_source_column:
+                name = options.source_column_name or "数据来源"
+                if name in body.columns:
+                    body = body.drop(columns=[name])
+                if options.source_position == "first":
+                    body.insert(0, name, f.stem)
+                else:
+                    body[name] = f.stem
+
+            frames.append(body)
+            progress(done, total)
+
+        if frames:
+            merged = pd.concat(frames, ignore_index=True, sort=False)
+            if options.column_name_map:
+                merged = merged.rename(columns=options.column_name_map)
+            results[group_name] = merged
+
+    if not results:
         raise RuntimeError("所有文件都读取失败，无法合并")
 
     check_cancel()
-    log("正在合并数据 ...")
-    merged = pd.concat(frames, ignore_index=True, sort=False)
-
-    if options.column_name_map:
-        merged = merged.rename(columns=options.column_name_map)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     log("正在写入文件：" + str(out_path))
 
     # 先写临时文件再原子替换：中途失败或取消不会留下半截文件。
@@ -968,14 +983,22 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
     tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
     try:
         if out_path.suffix.lower() == ".csv":
-            merged.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+            if len(results) > 1:
+                raise ValueError(
+                    "输出为 CSV 时只能有一个工作表；当前按子表分出了 %d 组，"
+                    "请把输出改成 .xlsx" % len(results))
+            only = next(iter(results.values()))
+            only.to_csv(tmp_path, index=False, encoding="utf-8-sig")
         else:
+            used_names = set()
             with pd.ExcelWriter(tmp_path, engine="openpyxl",
                                 datetime_format=options.output_date_format or "yyyy-mm-dd") as writer:
-                merged.to_excel(writer, index=False, sheet_name="汇总")
+                for name, df in results.items():
+                    sheet = _safe_sheet_name(name if name is not None else "汇总", used_names)
+                    df.to_excel(writer, index=False, sheet_name=sheet)
             if options.autofit_columns:
                 log("正在调整列宽 ...")
-                _autofit_excel_columns(tmp_path, sheet_name="汇总")
+                _autofit_excel_columns(tmp_path)
         check_cancel()
         os.replace(str(tmp_path), str(out_path))
     finally:
@@ -985,10 +1008,15 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
             except OSError:
                 pass
 
-    log("完成：" + str(len(frames)) + " 个文件 / 共 " +
-        str(len(merged)) + " 行 x " + str(merged.shape[1]) + " 列")
-    log("最终表头：" + str(list(merged.columns)))
+    total_rows = sum(len(df) for df in results.values())
+    if len(results) == 1:
+        log("完成：%d 行 x %d 列" % (total_rows, next(iter(results.values())).shape[1]))
+    else:
+        log("完成：共 %d 个工作表 / %d 行" % (len(results), total_rows))
+    for name, df in results.items():
+        log("  · %s：%d 行 x %d 列" % (name if name is not None else "汇总",
+                                       len(df), df.shape[1]))
     if failed:
-        log("有 " + str(len(failed)) + " 个文件读取失败：" + str([n for n, _ in failed]))
+        log("有 %d 个表读取失败：%s" % (len(failed), [n for n, _ in failed]))
 
-    return merged
+    return results
