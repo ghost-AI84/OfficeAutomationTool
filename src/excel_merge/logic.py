@@ -485,13 +485,48 @@ def _merged_cells_map(path, sheet_name, max_row):
 
 
 def inspect_headers(path, sheet_name=0):
-    """给界面用：返回某个文件的表头识别结果。"""
+    """给界面用：返回某个文件的表头识别结果（"all" 时看第一张有数据的表）。"""
     p = Path(path)
-    sheet = _resolve_sheet(p, sheet_name)
-    raw = _read_raw(p, sheet_name=sheet)
+    sheets = _sheet_list(p, sheet_name)
+    _label, param = sheets[0]
+    raw = _read_raw(p, sheet_name=param)
     if len(raw) == 0:
         return HeaderInfo(0, 0, 0.0, "空表")
     return detect_header(raw)
+
+
+def _sheet_list(path, sheet_spec, log=None):
+    """返回 [(显示名, 传给 pandas 的 sheet 参数), ...]。
+
+    sheet_spec == "all" 时把每个有数据的子表都列出来，各自当一段数据合并。
+    """
+    ext = path.suffix.lower()
+    if ext == ".csv" or ext not in ENGINE_MAP:
+        return [(None, 0)]
+    if sheet_spec != "all":
+        resolved = _resolve_sheet(path, sheet_spec, log)
+        label = resolved if isinstance(resolved, str) else None
+        return [(label, resolved)]
+
+    try:
+        xl = pd.ExcelFile(str(path), engine=ENGINE_MAP[ext])
+        names = list(xl.sheet_names)
+    except Exception:
+        return [(None, 0)]
+
+    out = []
+    for name in names:
+        try:
+            probe = pd.read_excel(str(path), sheet_name=name, header=None, nrows=30,
+                                  engine=ENGINE_MAP[ext], dtype=object)
+        except Exception:
+            continue
+        if len(probe) == 0 or int(probe.notna().sum().sum()) < 2:
+            if log:
+                log("  跳过空工作表：" + str(name))
+            continue
+        out.append((name, name))
+    return out or [(None, 0)]
 
 
 def _row_has_merge(merged, row):
@@ -714,7 +749,21 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
     if not candidates:
         raise ValueError("没有可用的输入文件")
 
-    total = len(candidates)
+    # 把"文件"展开成"文件里的每一张子表"：每张表单独识别表头，各自成段
+    units = []
+    for f in candidates:
+        sheets = _sheet_list(f, options.sheet_name, log)
+        multi = len(sheets) > 1
+        for label, param in sheets:
+            if multi and label is not None:
+                source_value = f.stem + "/" + str(label)
+            else:
+                source_value = f.stem
+            units.append((f, label, param, source_value))
+    if not units:
+        raise ValueError("没有可用的工作表")
+
+    total = len(units)
     progress(0, total)
     check_cancel()
 
@@ -733,19 +782,25 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
     force_types = options.force_types or {}
 
     frames, failed = [], []
-    for idx, f in enumerate(candidates, start=1):
+    for idx, (f, sheet_label, sheet_param, source_value) in enumerate(units, start=1):
         check_cancel()
-        sheet = _resolve_sheet(f, options.sheet_name, log)
+        sheet = sheet_param
+        display = f.name if sheet_label is None else "%s/%s" % (f.name, sheet_label)
+        if sheet_label is not None:
+            log("[" + str(idx) + "/" + str(total) + "] 读取 " + f.name +
+                " 的「" + str(sheet_label) + "」表")
         try:
             raw = _read_raw(f, sheet_name=sheet)
         except Exception as e:
             failed.append((f.name, repr(e)))
-            log("[跳过] " + f.name + " 读取失败：" + str(e))
+            log("[跳过] " + f.name +
+                (" / " + str(sheet_label) if sheet_label else "") +
+                " 读取失败：" + str(e))
             progress(idx, total)
             continue
 
         if len(raw) == 0:
-            log("[跳过] " + f.name + " 内容为空")
+            log("[跳过] " + display + " 内容为空")
             progress(idx, total)
             continue
 
@@ -807,7 +862,7 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
             # 第一个文件：作为主表头
             master_cols = list(final_cols)
             master_keys = [make_key(c) for c in final_cols]
-            log("[" + str(idx) + "/" + str(total) + "] 已读取 " + f.name +
+            log("[" + str(idx) + "/" + str(total) + "] 已读取 " + display +
                 "  表头行=" + header_label +
                 "  数据=" + str(body.shape[0]) + " 行 x " + str(body.shape[1]) + " 列")
             log("  该文件作为主表头，共 " + str(len(master_cols)) + " 列")
@@ -833,7 +888,7 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
             if rename_map:
                 body = body.rename(columns=rename_map)
 
-            log("[" + str(idx) + "/" + str(total) + "] 已读取 " + f.name +
+            log("[" + str(idx) + "/" + str(total) + "] 已读取 " + display +
                 "  表头行=" + header_label +
                 "  数据=" + str(body.shape[0]) + " 行 x " + str(body.shape[1]) + " 列")
 
@@ -860,6 +915,11 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
         if options.drop_summary_rows:
             body = _drop_summary_rows(body, log)
 
+        if len(body) == 0:
+            log("  该表没有数据行，已跳过")
+            progress(idx, total)
+            continue
+
         if options.drop_empty_cols:
             keep = [c for c in body.columns if not body[c].isna().all()]
             body = body[keep]
@@ -882,9 +942,9 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
             if name in body.columns:      # 避免与原表同名列冲突
                 body = body.drop(columns=[name])
             if options.source_position == "first":
-                body.insert(0, name, f.stem)
+                body.insert(0, name, source_value)
             else:
-                body[name] = f.stem
+                body[name] = source_value
 
         frames.append(body)
         progress(idx, total)

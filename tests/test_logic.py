@@ -255,6 +255,36 @@ def test_autofit_column_widths():
     print("  autofit writes column widths      OK  %s" % [round(w, 1) for w in widths])
 
 
+def test_all_sheets_in_one_workbook():
+    """一个工作簿里有多个子表：每张表单独识别、合并成一段数据。"""
+    from openpyxl import Workbook
+    path = WORK / "multi_sheet.xlsx"
+    wb = Workbook()
+    wb.remove(wb.active)
+    for name in ("1月", "2月", "说明"):
+        ws = wb.create_sheet(name)
+        if name == "说明":
+            ws["A1"] = "本表为说明"
+            continue
+        ws.append(["姓名", "金额"])
+        ws.append([name + "甲", "100"])
+        ws.append([name + "乙", "200"])
+    wb.save(path)
+
+    df, logs = run([str(path)], out="multi_sheet_out.xlsx",
+                   sheet_name="all", header_row=None)
+    assert len(df) == 4, len(df)
+    assert set(df["数据来源"]) == {"multi_sheet/1月", "multi_sheet/2月"}, \
+        df["数据来源"].tolist()
+    assert any("跳过空工作表" in m or "说明" in m for m in logs)
+    print("  all sheets in one workbook        OK")
+
+    # 默认（只读第一张）仍然可用，不破坏原行为
+    df2, _ = run([str(path)], out="multi_sheet_one.xlsx", header_row=None)
+    assert len(df2) == 2, len(df2)
+    print("  default single-sheet unchanged    OK")
+
+
 TESTS = [
     test_order_defines_master_header,
     test_sort_by_name,
@@ -271,6 +301,7 @@ TESTS = [
     test_drop_summary_row,
     test_sheet_auto,
     test_autofit_column_widths,
+    test_all_sheets_in_one_workbook,
 ]
 
 
