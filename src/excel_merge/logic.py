@@ -52,10 +52,14 @@ OUTPUT_EXTS = (".xlsx", ".csv")
 
 NA_TOKENS = {
     "", "-", "--", "—", "/", "\\", "na", "n/a", "null", "none",
-    "nan", "nil", "无", "空", "暂无", "#n/a", "#value!", "#div/0!",
+    "nan", "nil", "空", "暂无", "#n/a", "#value!", "#div/0!",
 }
 TRUE_TOKENS = {"是", "有", "y", "yes", "true", "t", "√", "✓", "对"}
 FALSE_TOKENS = {"否", "无", "n", "no", "false", "f", "×", "✗", "错"}
+
+# 布尔列在输出里用中文表示，而不是 TRUE/FALSE
+TRUE_LABEL = "是"
+FALSE_LABEL = "否"
 
 # 表头智能探测关键词库（增加权重，降低大标题误判）
 HEADER_KEYWORDS = {
@@ -339,7 +343,17 @@ def _convert_column(series, dtype, date_format=None):
     if dtype == "number":
         return s.map(_to_number).astype("Float64")
     if dtype == "bool":
-        return s.map(_to_bool).astype("boolean")
+        # 输出中文"是/否"，避免 Excel 里出现 TRUE/FALSE；
+        # 认不出来的值原样保留，不硬转。
+        def _to_label(v):
+            b = _to_bool(v)
+            if b is True:
+                return TRUE_LABEL
+            if b is False:
+                return FALSE_LABEL
+            return v
+
+        return s.map(_to_label)
     if dtype == "datetime":
         return _safe_to_datetime(s, fmt=date_format)
     return s.map(lambda v: _clean_text(v) if isinstance(v, str) else v)

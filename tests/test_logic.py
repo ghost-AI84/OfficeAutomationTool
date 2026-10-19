@@ -386,6 +386,20 @@ def test_extra_sheet_not_force_matched():
     print("  extra sheet not force-matched    OK")
 
 
+def test_bool_columns_output_chinese():
+    """是否列输出中文「是/否」，不能变成 TRUE/FALSE；「无」也不能被当成空值。"""
+    f = make("bool.xlsx", ["姓名", "是否实名", "是否纳入"],
+             [["张三", "是", "有"], ["李四", "否", "无"], ["王五", "√", None]])
+    df, _ = run([f], out="bool_out.xlsx")
+    assert list(df["是否实名"]) == ["是", "否", "是"], df["是否实名"].tolist()
+    assert list(df["是否纳入"])[:2] == ["是", "否"], df["是否纳入"].tolist()
+
+    back = pd.read_excel(WORK / "bool_out.xlsx")
+    assert list(back["是否实名"]) == ["是", "否", "是"], back["是否实名"].tolist()
+    assert list(back["是否纳入"])[:2] == ["是", "否"], back["是否纳入"].tolist()
+    print("  bool columns stay Chinese        OK")
+
+
 def _inject_text_autofilter(path):
     """给工作表塞一个"文字型自定义筛选"，复现 openpyxl 3.1.2 的解析崩溃。"""
     import shutil
@@ -441,6 +455,7 @@ TESTS = [
     test_sheets_matched_by_similar_name,
     test_sheets_matched_by_position,
     test_extra_sheet_not_force_matched,
+    test_bool_columns_output_chinese,
     test_text_autofilter_workbook_is_readable,
 ]
 
