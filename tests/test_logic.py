@@ -307,6 +307,85 @@ def test_all_sheets_in_one_workbook():
     print("  default single-sheet unchanged    OK")
 
 
+def test_sheets_matched_by_similar_name():
+    """子表名不完全一致但相似：附件1-台账 / 附件1：台账 要配成一组。"""
+    from openpyxl import Workbook
+
+    def build(filename, names, rows):
+        p = WORK / filename
+        wb = Workbook()
+        wb.remove(wb.active)
+        for name in names:
+            ws = wb.create_sheet(name)
+            ws.append(["姓名", "金额"])
+            for r in rows:
+                ws.append(r)
+        wb.save(p)
+        return str(p)
+
+    a = build("sim_a.xlsx", ["附件1-台账", "附件2-发票"], [["甲", "100"]])
+    b = build("sim_b.xlsx", ["附件1：台账", "附件2（发票）"], [["乙", "200"]])
+
+    groups, logs = merge_groups([a, b], out="sim_out.xlsx",
+                                sheet_name="all", header_row=None)
+    assert list(groups.keys()) == ["附件1-台账", "附件2-发票"], list(groups.keys())
+    assert len(groups["附件1-台账"]) == 2, len(groups["附件1-台账"])
+    assert len(groups["附件2-发票"]) == 2, len(groups["附件2-发票"])
+    assert any("对应到" in m for m in logs)
+    print("  similar sheet names matched       OK")
+
+
+def test_sheets_matched_by_position():
+    """名字差异很大（1.1 / 2.1）时按顺序配对。"""
+    from openpyxl import Workbook
+
+    def build(filename, names):
+        p = WORK / filename
+        wb = Workbook()
+        wb.remove(wb.active)
+        for i, name in enumerate(names):
+            ws = wb.create_sheet(name)
+            ws.append(["姓名", "金额"])
+            ws.append([filename + str(i), str(i)])
+        wb.save(p)
+        return str(p)
+
+    a = build("pos_a.xlsx", ["1.1", "1.2"])
+    b = build("pos_b.xlsx", ["2.1", "2.2"])
+
+    groups, logs = merge_groups([a, b], out="pos_out.xlsx",
+                                sheet_name="all", header_row=None)
+    assert list(groups.keys()) == ["1.1", "1.2"], list(groups.keys())
+    assert len(groups["1.1"]) == 2 and len(groups["1.2"]) == 2
+    print("  sheets matched by position        OK")
+
+
+def test_extra_sheet_not_force_matched():
+    """子表数量对不上时不能硬配：多出来的「汇总」表要跳过，而不是塞进第 1 组。"""
+    from openpyxl import Workbook
+
+    def build(filename, sheets):
+        p = WORK / filename
+        wb = Workbook()
+        wb.remove(wb.active)
+        for name in sheets:
+            ws = wb.create_sheet(name)
+            ws.append(["姓名", "金额"])
+            ws.append([filename + name, "1"])
+        wb.save(p)
+        return str(p)
+
+    a = build("cnt_a.xlsx", ["附件1", "附件2"])
+    b = build("cnt_old_合并.xlsx", ["汇总"])
+
+    groups, logs = merge_groups([a, b], out="cnt_out.xlsx",
+                                sheet_name="all", header_row=None)
+    assert list(groups.keys()) == ["附件1", "附件2"], list(groups.keys())
+    assert len(groups["附件1"]) == 1, len(groups["附件1"])   # 只有 a 的行
+    assert any("没有对得上的组" in m for m in logs)
+    print("  extra sheet not force-matched    OK")
+
+
 def _inject_text_autofilter(path):
     """给工作表塞一个"文字型自定义筛选"，复现 openpyxl 3.1.2 的解析崩溃。"""
     import shutil
@@ -359,6 +438,9 @@ TESTS = [
     test_sheet_auto,
     test_autofit_column_widths,
     test_all_sheets_in_one_workbook,
+    test_sheets_matched_by_similar_name,
+    test_sheets_matched_by_position,
+    test_extra_sheet_not_force_matched,
     test_text_autofilter_workbook_is_readable,
 ]
 

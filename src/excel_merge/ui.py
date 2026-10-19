@@ -47,6 +47,29 @@ FILE_TYPES = [
     ("所有文件", "*.*"),
 ]
 
+# 工作表下拉选项：显示文字 -> 内部取值
+SHEET_CHOICES = [
+    ("第一个工作表", "0"),
+    ("自动选择有数据的表", "auto"),
+    ("所有子表（按名字分组）", "all"),
+]
+
+
+def sheet_label(code):
+    code = str(code)
+    for label, value in SHEET_CHOICES:
+        if value == code:
+            return label
+    return code
+
+
+def sheet_code(text):
+    text = str(text).strip()
+    for label, value in SHEET_CHOICES:
+        if text == label:
+            return value
+    return text
+
 
 def enable_dpi_awareness():
     """声明 DPI 感知。必须在创建 Tk 窗口之前调用。
@@ -79,12 +102,14 @@ class MergeApp:
         self.worker = None
         self.cancel_event = threading.Event()
         self._last_scan_ok = True
+        self._poll_id = None
 
         self.scale = self._detect_scale()
         self._setup_window()
         self._init_vars()
         self._build_ui()
         self._sync_header_entry()
+        self.root.bind("<Destroy>", self._on_destroy, add="+")
         self._poll_queue()
 
     # ------------------------------------------------------------ 初始化
@@ -116,7 +141,7 @@ class MergeApp:
         s = self.settings
         self.v_header_mode = tk.StringVar(value=s["header_mode"])
         self.v_header_row = tk.StringVar(value=str(s["header_row"]))
-        self.v_sheet = tk.StringVar(value=s["sheet"])
+        self.v_sheet = tk.StringVar(value=sheet_label(s["sheet"]))
 
         self.v_source = tk.BooleanVar(value=s["source_enabled"])
         self.v_source_pos = tk.StringVar(value=s["source_position"])
@@ -238,8 +263,10 @@ class MergeApp:
         row = ttk.Frame(tab)
         row.pack(fill="x", padx=8, pady=4)
         ttk.Label(row, text="工作表：").pack(side="left")
-        ttk.Entry(row, textvariable=self.v_sheet, width=18).pack(side="left", padx=4)
-        ttk.Label(row, text="（0 = 第一个；auto = 自动挑有数据的表；all = 按子表分组合并；也可填表名）",
+        self.sheet_combo = ttk.Combobox(row, textvariable=self.v_sheet, width=26,
+                                        values=[lbl for lbl, _ in SHEET_CHOICES])
+        self.sheet_combo.pack(side="left", padx=4)
+        ttk.Label(row, text="（选“所有子表”会把同名子表合并到各自的工作表；也可直接输入表名）",
                   foreground="#666").pack(side="left")
 
         row = ttk.Frame(tab)
@@ -617,7 +644,7 @@ class MergeApp:
             except ValueError:
                 raise ValueError("表头行号必须是大于等于 1 的整数")
 
-        sheet_raw = self.v_sheet.get().strip()
+        sheet_raw = sheet_code(self.v_sheet.get())
         if sheet_raw.lower() == "auto":
             sheet_name = "auto"
         elif sheet_raw in ("", "0"):
@@ -739,15 +766,33 @@ class MergeApp:
 
     # ------------------------------------------------------------ 消息循环
     def _poll_queue(self):
-        items = []
         try:
-            while True:
-                items.append(self.msg_queue.get_nowait())
-        except queue.Empty:
+            if not self.root.winfo_exists():
+                return
+            items = []
+            try:
+                while True:
+                    items.append(self.msg_queue.get_nowait())
+            except queue.Empty:
+                pass
+            if items:
+                self._handle_messages(items)
+            self._poll_id = self.root.after(POLL_MS, self._poll_queue)
+        except tk.TclError:
+            # 窗口已经销毁，停止轮询
             pass
-        if items:
-            self._handle_messages(items)
-        self.root.after(POLL_MS, self._poll_queue)
+
+    def _stop_poll(self):
+        if self._poll_id is not None:
+            try:
+                self.root.after_cancel(self._poll_id)
+            except tk.TclError:
+                pass
+            self._poll_id = None
+
+    def _on_destroy(self, event):
+        if event.widget is self.root:
+            self._stop_poll()
 
     def _handle_messages(self, items):
         logs = []
@@ -821,7 +866,7 @@ class MergeApp:
         if not self.files:
             messagebox.showinfo("提示", "请先添加要合并的文件")
             return
-        sheet_raw = self.v_sheet.get().strip()
+        sheet_raw = sheet_code(self.v_sheet.get())
         sheet_name = 0 if sheet_raw in ("", "0") else sheet_raw
         HeaderDialog(self, list(self.files), sheet_name, self.header_overrides)
 
@@ -842,7 +887,7 @@ class MergeApp:
             s["header_row"] = int(self.v_header_row.get().strip())
         except ValueError:
             s["header_row"] = 1
-        s["sheet"] = self.v_sheet.get().strip() or "0"
+        s["sheet"] = sheet_code(self.v_sheet.get()) or "0"
         s["source_enabled"] = bool(self.v_source.get())
         s["source_position"] = self.v_source_pos.get()
         s["source_name"] = self.v_source_name.get().strip() or "数据来源"

@@ -14,6 +14,7 @@ Excel 合并引擎（与界面完全解耦，可单独调用 / 单独测试）�
 """
 
 import datetime
+import difflib
 import os
 import re
 import unicodedata
@@ -732,6 +733,72 @@ def _unique_columns(cols):
     return final_cols
 
 
+def _sheet_similarity(a, b):
+    """两个子表名的相似度（先做空格/全半角归一）。"""
+    return difflib.SequenceMatcher(None, _match_key(a), _match_key(b)).ratio()
+
+
+def _group_sheets(per_file, log):
+    """把各文件的子表两两配对成组。
+
+    以第一个文件的子表为基准（决定输出工作表名），其余文件的子表按
+    名字相似度匹配；配不上的按位置补。这样 1.1/2.1、附件1/附件1（新）
+    这种"相似但不完全相同"的名字也能对上。
+    """
+    ref_f, ref_sheets = per_file[0]
+    ref_names = [str(lbl) for lbl, _ in ref_sheets]
+    groups = OrderedDict()
+    for i, name in enumerate(ref_names):
+        groups[name] = [(ref_f, ref_sheets[i][0], ref_sheets[i][1])]
+
+    for f, sheets in per_file[1:]:
+        pairs = []
+        for j, (label, _param) in enumerate(sheets):
+            for i, ref_name in enumerate(ref_names):
+                pairs.append((_sheet_similarity(str(label), ref_name), i, j))
+        pairs.sort(reverse=True)
+
+        assigned = {}
+        taken = set()
+        for ratio, i, j in pairs:
+            if i in assigned or j in taken:
+                continue
+            if ratio >= 0.55:
+                assigned[i] = j
+                taken.add(j)
+
+        # 相似度不够的：只有子表数量与基准一致时才按顺序补位，
+        # 否则说明结构根本不同（比如上一次的合并产物），直接跳过
+        if len(sheets) == len(ref_names):
+            for j, (label, _param) in enumerate(sheets):
+                if j in taken:
+                    continue
+                for i in range(len(ref_names)):
+                    if i not in assigned:
+                        assigned[i] = j
+                        taken.add(j)
+                        if log:
+                            log("  子表「%s」按顺序对应到「%s」（名字相似度低）"
+                                % (label, ref_names[i]))
+                        break
+        else:
+            for j, (label, _param) in enumerate(sheets):
+                if j not in taken and log:
+                    log("  子表「%s」没有对得上的组，已跳过（该文件 %d 张表，基准 %d 张）"
+                        % (label, len(sheets), len(ref_names)))
+
+        for i, j in sorted(assigned.items()):
+            label, param = sheets[j]
+            if log and _sheet_similarity(str(label), ref_names[i]) < 1.0:
+                log("  子表「%s」对应到「%s」" % (label, ref_names[i]))
+            groups[ref_names[i]].append((f, label, param))
+
+        if len(sheets) > len(ref_names) and log:
+            log("  注意：%s 有 %d 张子表，比基准多；多出的未参与合并"
+                % (f.name, len(sheets) - len(ref_names)))
+    return groups
+
+
 def merge_files(files, options, log_callback=None, progress_callback=None,
                 cancel_event=None):
     """按 options 合并 files，返回 OrderedDict：工作表名 -> DataFrame。
@@ -772,13 +839,11 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
     if not candidates:
         raise ValueError("没有可用的输入文件")
 
-    # ---- 分组：all 时按子表名分组，其余情况所有文件共用一个分组 ----
+    # ---- 分组：all 时把各文件的子表按名字相似度一一对应 ----
     groups = OrderedDict()
     if options.sheet_name == "all":
-        for f in candidates:
-            for label, param in _sheet_list(f, options.sheet_name, log):
-                key = str(label) if label is not None else "Sheet1"
-                groups.setdefault(key, []).append((f, label, param))
+        per_file = [(f, _sheet_list(f, options.sheet_name, log)) for f in candidates]
+        groups = _group_sheets(per_file, log)
     else:
         units = []
         for f in candidates:

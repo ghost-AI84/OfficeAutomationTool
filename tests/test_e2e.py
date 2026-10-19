@@ -89,8 +89,76 @@ def main():
     print("  overwrite prompt cancels safely   OK")
 
     root.destroy()
+    run_grouped_case()
     print("e2e tests passed")
     return 0
+
+
+def run_grouped_case():
+    """多个子表按名字分组：附件1 归附件1，附件2 归附件2，输出两个 sheet。"""
+    from openpyxl import Workbook, load_workbook
+
+    work = Path(tempfile.mkdtemp(prefix="merge-grouped-"))
+
+    def build(name, rows1, rows2):
+        p = work / name
+        wb = Workbook()
+        wb.remove(wb.active)
+        ws1 = wb.create_sheet("附件1")
+        ws1.append(["姓名", "金额"])
+        for r in rows1:
+            ws1.append(r)
+        ws2 = wb.create_sheet("附件2")
+        ws2.append(["单位", "数量"])
+        for r in rows2:
+            ws2.append(r)
+        note = wb.create_sheet("说明")
+        note["A1"] = "说明页"
+        wb.save(p)
+        return str(p)
+
+    a = build("甲所.xlsx", [["张三", "100"], ["李四", "200"]], [["A局", "5"]])
+    b = build("乙所.xlsx", [["王五", "300"]], [["B局", "7"], ["C局", "9"]])
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        print("SKIP grouped case: no display (%s)" % e)
+        return
+    apply_default_fonts(root)
+    try:
+        ttk.Style().theme_use("clam")
+    except tk.TclError:
+        pass
+
+    app = MergeApp(root)
+    root.update_idletasks()
+    app._add_paths([a, b])
+    out = work / "结果.xlsx"
+    app.v_output.set(str(out))
+    app.v_sheet.set("所有子表（按名字分组）")
+    app.start_merge()
+
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        root.update()
+        if app.worker is not None and not app.worker.is_alive():
+            for _ in range(6):
+                time.sleep(0.1)
+                root.update()
+            break
+
+    assert out.exists(), "grouped output not produced"
+    wb = load_workbook(out)
+    assert wb.sheetnames == ["附件1", "附件2"], wb.sheetnames
+    assert wb["附件1"].max_row == 4, wb["附件1"].max_row    # 3 条数据 + 表头
+    assert wb["附件2"].max_row == 4, wb["附件2"].max_row
+    headers1 = [c.value for c in wb["附件1"][1]][:2]
+    headers2 = [c.value for c in wb["附件2"][1]][:2]
+    assert headers1 == ["姓名", "金额"], headers1
+    assert headers2 == ["单位", "数量"], headers2
+    print("  grouped sheets through UI         OK  %s" % wb.sheetnames)
+    root.destroy()
 
 
 if __name__ == "__main__":
