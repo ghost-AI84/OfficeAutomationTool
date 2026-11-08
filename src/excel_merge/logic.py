@@ -224,9 +224,18 @@ def _to_number(v):
     if not s:
         return np.nan
 
-    is_pct = s.endswith("%")
-    if is_pct:
-        s = s[:-1].strip()
+    # 身份证 / 银行账号 / 长编号：转成数字会丢精度（Excel 只有 15 位有效数字），
+    # 前导零也是编号的一部分，这两种情况一律保持文本
+    digits = s.replace(",", "").replace("，", "").strip()
+    if digits.isdigit():
+        if len(digits) > 1 and digits.startswith("0"):
+            return v
+        if len(digits) >= 12:
+            return v
+
+    # 百分比保持原文："50%" 变成 0.5 会改变显示和含义
+    if s.endswith("%"):
+        return v
 
     # 处理中文单位
     multiplier = 1
@@ -253,11 +262,9 @@ def _to_number(v):
     except ValueError:
         return v
 
-    if is_pct:
-        num /= 100.0
     if neg:
         num = -num
-    if num.is_integer() and not is_pct:
+    if num.is_integer():
         return int(num)
     return num
 
@@ -364,8 +371,20 @@ def _convert_column(series, dtype, date_format=None, log=None, column=""):
 
         return s.map(_to_label)
     if dtype == "datetime":
-        return _safe_to_datetime(s, fmt=date_format)
-    return s.map(lambda v: _clean_text(v) if isinstance(v, str) else v)
+        parsed = _safe_to_datetime(s, fmt=date_format)
+        missing = s.notna() & parsed.isna()
+        if bool(missing.any()):
+            if log:
+                samples = [str(v) for v in s[missing].head(3).tolist()]
+                log("  列「%s」有 %d 个日期无法识别，已按原文保留（如 %s）"
+                    % (column, int(missing.sum()), "、".join(samples)))
+            # 认不出的保留原文，不写成空值
+            out = parsed.astype(object)
+            out[missing] = s[missing]
+            return out
+        return parsed
+    # 文本列只去首尾空白：不再做全角转半角，避免把「（咸）」「：」这类原文改掉
+    return s.map(lambda v: v.strip() if isinstance(v, str) else v)
 
 
 def normalize_dataframe(df, date_format=None, force_types=None, log=None):

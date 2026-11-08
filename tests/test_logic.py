@@ -412,6 +412,39 @@ def test_mixed_numeric_column_does_not_crash():
     print("  mixed numeric column survives    OK")
 
 
+def test_preserve_ids_and_leading_zeros():
+    """身份证 / 长编号 / 前导零不能被转成数字（会丢精度或丢零）。"""
+    f = make("ids.xlsx", ["身份证", "编号", "金额"],
+             [["110101199001011234", "00123", "100"],
+              ["310101199002022345", "00456", "200"]])
+    df, _ = run([f], out="ids_out.xlsx")
+    assert df["身份证"].tolist() == ["110101199001011234", "310101199002022345"], \
+        df["身份证"].tolist()
+    assert df["编号"].tolist() == ["00123", "00456"], df["编号"].tolist()
+    assert df["金额"].tolist() == [100, 200], df["金额"].tolist()
+    print("  ids / leading zeros keep text    OK")
+
+
+def test_preserve_fullwidth_text_and_percent():
+    """文本列不做全角转半角；百分比保持原文。"""
+    f = make("fmt.xlsx", ["机构", "占比"],
+             [["（咸）某某所", "50%"], ["（双）另一所", "30%"]])
+    df, _ = run([f], out="fmt_out.xlsx")
+    assert df["机构"].tolist() == ["（咸）某某所", "（双）另一所"], df["机构"].tolist()
+    assert df["占比"].tolist() == ["50%", "30%"], df["占比"].tolist()
+    print("  full-width text + percent kept   OK")
+
+
+def test_unparseable_date_kept_as_text():
+    """日期列里识别不了的值要保留原文，不能悄悄变成空值。"""
+    rows = [["2024-01-0%d" % d] for d in range(1, 7)] + [["不是日期"]]
+    f = make("dates.xlsx", ["日期"], rows)
+    df, logs = run([f], out="dates_out.xlsx")
+    assert df["日期"].tolist()[-1] == "不是日期", df["日期"].tolist()[-1]
+    assert any("日期无法识别" in m for m in logs), logs[-5:]
+    print("  bad date kept as text            OK")
+
+
 def _inject_text_autofilter(path):
     """给工作表塞一个"文字型自定义筛选"，复现 openpyxl 3.1.2 的解析崩溃。"""
     import shutil
@@ -469,6 +502,9 @@ TESTS = [
     test_extra_sheet_not_force_matched,
     test_bool_columns_output_chinese,
     test_mixed_numeric_column_does_not_crash,
+    test_preserve_ids_and_leading_zeros,
+    test_preserve_fullwidth_text_and_percent,
+    test_unparseable_date_kept_as_text,
     test_text_autofilter_workbook_is_readable,
 ]
 
