@@ -335,13 +335,22 @@ def _infer_col_type(series):
     return "text"
 
 
-def _convert_column(series, dtype, date_format=None):
+def _convert_column(series, dtype, date_format=None, log=None, column=""):
     # 先统一将 NA 字符串替换为真正的 np.nan
     s = series.map(
         lambda v: np.nan if (isinstance(v, str) and _clean_text(v).lower() in NA_TOKENS) else v
     )
     if dtype == "number":
-        return s.map(_to_number).astype("Float64")
+        # 逐值转换，不做整列 astype：混了少量文字（如「详见附件」）时，
+        # astype("Float64") 会直接抛 could not convert string to float。
+        converted = s.map(_to_number)
+        bad = converted.map(lambda v: isinstance(v, str))
+        if bool(bad.any()):
+            if log:
+                samples = [str(v) for v in converted[bad].head(3).tolist()]
+                log("  列「%s」有 %d 个值无法转成数字，已按原文保留（如 %s）"
+                    % (column, int(bad.sum()), "、".join(samples)))
+        return converted
     if dtype == "bool":
         # 输出中文"是/否"，避免 Excel 里出现 TRUE/FALSE；
         # 认不出来的值原样保留，不硬转。
@@ -359,17 +368,18 @@ def _convert_column(series, dtype, date_format=None):
     return s.map(lambda v: _clean_text(v) if isinstance(v, str) else v)
 
 
-def normalize_dataframe(df, date_format=None, force_types=None):
+def normalize_dataframe(df, date_format=None, force_types=None, log=None):
     df = df.copy()
     force_types = force_types or {}
     for col in df.columns:
         if col in force_types:
-            df[col] = _convert_column(df[col], force_types[col], date_format)
+            df[col] = _convert_column(df[col], force_types[col], date_format,
+                                      log, str(col))
             continue
         if pd.api.types.is_numeric_dtype(df[col]) and not pd.api.types.is_bool_dtype(df[col]):
             continue
         dtype = _infer_col_type(df[col])
-        df[col] = _convert_column(df[col], dtype, date_format)
+        df[col] = _convert_column(df[col], dtype, date_format, log, str(col))
     return df
 
 
@@ -1030,7 +1040,7 @@ def merge_files(files, options, log_callback=None, progress_callback=None,
                         if make_key(c) == kk:
                             force[c] = v
                 body = normalize_dataframe(body, date_format=options.date_format,
-                                           force_types=force)
+                                           force_types=force, log=log)
 
             if options.add_source_column:
                 name = options.source_column_name or "数据来源"

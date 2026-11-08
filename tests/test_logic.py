@@ -400,6 +400,18 @@ def test_bool_columns_output_chinese():
     print("  bool columns stay Chinese        OK")
 
 
+def test_mixed_numeric_column_does_not_crash():
+    """90% 是数字、混了「详见附件」的列不能整列 astype 崩掉。"""
+    rows = [["单位%d" % i, str(i * 100)] for i in range(1, 10)] + [["单位X", "详见附件"]]
+    f = make("mixed_num.xlsx", ["单位", "金额"], rows)
+    df, logs = run([f], out="mixed_num_out.xlsx")
+    assert len(df) == 10, len(df)
+    assert df["金额"].tolist()[:3] == [100, 200, 300], df["金额"].tolist()[:3]
+    assert df["金额"].tolist()[-1] == "详见附件", df["金额"].tolist()[-1]
+    assert any("无法转成数字" in m for m in logs), logs[-5:]
+    print("  mixed numeric column survives    OK")
+
+
 def _inject_text_autofilter(path):
     """给工作表塞一个"文字型自定义筛选"，复现 openpyxl 3.1.2 的解析崩溃。"""
     import shutil
@@ -456,6 +468,7 @@ TESTS = [
     test_sheets_matched_by_position,
     test_extra_sheet_not_force_matched,
     test_bool_columns_output_chinese,
+    test_mixed_numeric_column_does_not_crash,
     test_text_autofilter_workbook_is_readable,
 ]
 
